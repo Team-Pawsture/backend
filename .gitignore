@@ -30,3 +30,19 @@ Thumbs.db
 
 # 업로드 파일 (개발 중 임시)
 uploads/
+
+# Alembic (DB 마이그레이션 캐시)
+alembic/__pycache__/
+
+# pytest 캐시
+.pytest_cache/
+
+# coverage 리포트
+.coverage
+htmlcov/
+
+# mypy 캐시 (타입 체커)
+.mypy_cache/
+
+# 개인 작업 메모 (배포 전까지만 사용)
+NOTES.md
