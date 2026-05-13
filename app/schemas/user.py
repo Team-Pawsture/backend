@@ -14,8 +14,6 @@ from pydantic import BaseModel, Field, ConfigDict
 class UserSignupRequest(BaseModel):
     username: str = Field(..., min_length=4, max_length=20, description="아이디 (4~20자)")
     password: str = Field(..., min_length=8, max_length=100, description="비밀번호 (8자 이상)")
-    name: str = Field(..., min_length=1, max_length=50, description="보호자 성명")
-
 
 # ============================================
 # 회원가입 응답 (Response)
@@ -23,7 +21,6 @@ class UserSignupRequest(BaseModel):
 class UserSignupResponse(BaseModel):
     user_id: int
     username: str
-    name: str
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

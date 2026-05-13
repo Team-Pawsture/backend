@@ -44,7 +44,6 @@ def signup(request: UserSignupRequest, db: Session = Depends(get_db)):
     new_user = User(
         username=request.username,
         password=hashed_pw,
-        name=request.name
     )
     db.add(new_user)
     db.commit()
@@ -58,7 +57,6 @@ def signup(request: UserSignupRequest, db: Session = Depends(get_db)):
         result={
             "user_id": new_user.user_id,
             "username": new_user.username,
-            "name": new_user.name
         }
     )
 
@@ -99,7 +97,6 @@ def login(request: UserLoginRequest, db: Session = Depends(get_db)):
             "user": {
                 "user_id": user.user_id,
                 "username": user.username,
-                "name": user.name
             }
         }
     )
@@ -118,7 +115,6 @@ def get_me(current_user: User = Depends(get_current_user)):
         result={
             "user_id": current_user.user_id,
             "username": current_user.username,
-            "name": current_user.name,
             "created_at": current_user.created_at.isoformat()
         }
     )
