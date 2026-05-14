@@ -1,8 +1,8 @@
 """
 인증 관련 API 라우터
-- POST /auth/signup : 회원가입
-- (예정) POST /auth/login
-- (예정) GET /auth/me
+- POST /auth/signup : 회원가입 ✅ 구현 완료
+- POST /auth/login : 로그인 + JWT 발급 ✅ 구현 완료
+- GET /auth/me : 내 정보 조회 ✅ 구현 완료
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status

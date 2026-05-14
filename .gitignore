@@ -46,3 +46,9 @@ htmlcov/
 
 # 개인 작업 메모 (배포 전까지만 사용)
 NOTES.md
+
+# 업로드된 파일 (사용자 데이터)
+uploads/
+
+# VAPID keys
+*.pem

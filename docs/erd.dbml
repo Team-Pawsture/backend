@@ -1,0 +1,133 @@
+// ============================================
+// 1차 ERD - 반려견 슬개골 탈구 방지 걸음 분석 서비스
+// 성신에이전시 / 작성: 황다원
+// 버전: v3.2 (5/7 회의 + 카톡 결정사항 9개 반영)
+// ============================================
+// 변경사항 (v3.1 → v3.2):
+// 1. users: name 컬럼 제거
+// 2. pets: birth_year → birth_date 변경
+// 3. pets: gender 컬럼 추가
+// 4. pets: profile_image_url 컬럼 추가
+// 5. pets: breed enum 적용 (16종 + 기타)
+// 6. pets: medical_history enum 적용 (6개 카테고리)
+// 7. analyses: memo 컬럼 추가
+// 8. analyses: updated_at 컬럼 추가 (메모 수정 시 갱신)
+// 9. favorite_hospitals 테이블 신규 추가
+// 10. notifications: type enum에 favorite_added 추가
+// ============================================
+
+Table users {
+  user_id bigint [pk, increment]
+  username varchar [unique, not null, note: '아이디 (4~20자)']
+  password varchar [not null, note: '해시된 비밀번호 (bcrypt)']
+  created_at timestamp [default: `now()`]
+}
+
+Table pets {
+  pet_id bigint [pk, increment]
+  user_id bigint [ref: > users.user_id, not null]
+  name varchar [not null, note: '강아지 이름 (1~20자)']
+  birth_date date [not null, note: '생년월일 (YYYY-MM-DD)']
+  breed varchar [not null, note: '''견종 enum (16종 + 기타):
+  포메라니안, 말티즈, 토이푸들, 미니어처푸들, 치와와,
+  요크셔테리어, 시츄, 비숑프리제, 페키니즈, 미니핀,
+  빠삐용, 코카스파니엘, 보스턴테리어, 잭러셀테리어,
+  닥스훈트, 프렌치불독, 기타''']
+  gender varchar [not null, note: 'male / female (화면: 남아/여아)']
+  weight float [note: '체중 kg (선택)']
+  medical_history varchar [not null, note: '''과거 병력 enum (6개):
+  없음, 슬개골 탈구 이력 있음, 슬개골 수술 경험 있음,
+  관절 질환 (슬개골 외), 근육/인대 부상 이력, 기타''']
+  profile_image_url varchar [note: '프로필 사진 경로 (예: /uploads/pet_profiles/pet_1_abc123.jpg)']
+  created_at timestamp [default: `now()`]
+}
+
+Table analyses {
+  analysis_id bigint [pk, increment]
+  pet_id bigint [ref: > pets.pet_id, not null]
+  video_url varchar [not null, note: '업로드된 영상 URL']
+  status varchar [not null, default: 'pending', note: 'pending/processing/completed/failed']
+  risk_level varchar [note: 'normal / caution / danger (선예영님 답변 5/3 확정)']
+  ai_result json [note: '''AI 서버 요약 지표 (선예영님 답변 5/3 확정 - 39개 관절 raw 데이터 X, 요약 지표만)
+  {
+    "symmetry_score": float,        // 좌우대칭성 (0~1)
+    "gait_cycle_mean": float,       // 보행주기 평균 (초)
+    "gait_cycle_std": float,        // 보행주기 표준편차
+    "spine_stability": float,       // 척추안정성 (0~1)
+    "confidence": float,            // 관절 검출 신뢰도 (0~1)
+    "analyzed_at": "ISO 8601"       // 분석 완료 시각
+  }''']
+  memo varchar [note: '사용자 메모 (0~200자, nullable, 분석 완료 후 작성)']
+  created_at timestamp [default: `now()`]
+  updated_at timestamp [note: '메모 수정 시 갱신']
+}
+
+Table hospitals {
+  hospital_id bigint [pk, increment]
+  name varchar [not null]
+  address varchar
+  phone varchar
+  latitude float [not null]
+  longitude float [not null]
+  specialty varchar [note: '전문 분야 - 자체 큐레이션']
+  image_url varchar [note: '병원 사진 URL - 자체 큐레이션']
+  business_hours json [note: '요일별 영업시간 - 자체 큐레이션']
+  certifications varchar [note: '인증 (피어프리 등) - 자체 큐레이션']
+}
+
+Table favorite_hospitals {
+  favorite_id bigint [pk, increment]
+  pet_id bigint [ref: > pets.pet_id, not null, note: 'CASCADE: 강아지 삭제 시 함께 삭제']
+  hospital_id bigint [ref: > hospitals.hospital_id, not null]
+  created_at timestamp [default: `now()`]
+  
+  Indexes {
+    (pet_id, hospital_id) [unique, name: 'uniq_pet_hospital']
+  }
+}
+
+Table notifications {
+  notification_id bigint [pk, increment]
+  user_id bigint [ref: > users.user_id, not null]
+  type varchar [note: '''알림 type:
+  analysis_complete / high_risk_warning /
+  weekly_reminder / monthly_reminder /
+  favorite_added''']
+  title varchar
+  is_read boolean [default: false]
+  related_type varchar [note: 'analysis / pet / hospital - 클릭 시 이동할 화면 종류']
+  related_id bigint [note: '클릭 시 이동할 대상 ID']
+  created_at timestamp [default: `now()`]
+}
+
+// 룰 기반 추천 콘텐츠 (위험도 단계별 매핑)
+Table recommendations {
+  recommendation_id bigint [pk, increment]
+  risk_level varchar [not null, note: 'normal / caution / danger']
+  type varchar [not null, note: 'exercise / product / hospital_visit']
+  title varchar [not null, note: '예: 미끄럼방지 매트 추천']
+  content text [note: '상세 설명']
+  image_url varchar [note: '썸네일 이미지']
+  display_order int [default: 0, note: '표시 순서']
+  is_active boolean [default: true, note: '노출 여부']
+}
+
+// 푸시 알림 구독 정보 (Web Push)
+Table push_subscriptions {
+  subscription_id bigint [pk, increment]
+  user_id bigint [ref: > users.user_id, not null]
+  endpoint varchar [not null, note: '브라우저 푸시 엔드포인트 URL']
+  p256dh_key varchar [not null, note: '암호화 공개키']
+  auth_key varchar [not null, note: '인증키']
+  user_agent varchar [note: '디바이스 식별용 (선택)']
+  created_at timestamp [default: `now()`]
+}
+
+// ============================================
+// [2차 추가 예정 테이블] - 1차에서는 제외
+// ============================================
+// reviews          : 병원 리뷰 (별점, 후기)
+// reports          : 위험도 변화 추이 리포트
+// teachers         : 동물병원 선생님 리스트
+// community_posts  : 커뮤니티 게시글
+// community_comments : 커뮤니티 댓글

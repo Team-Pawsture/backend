@@ -5,7 +5,6 @@
 - 영상 저장 + 삭제
 """
 
-import os
 import uuid
 from pathlib import Path
 from fastapi import UploadFile

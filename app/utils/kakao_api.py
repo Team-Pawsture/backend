@@ -7,7 +7,6 @@
 import os
 import asyncio
 import aiohttp
-from typing import Optional
 
 
 # ============================================

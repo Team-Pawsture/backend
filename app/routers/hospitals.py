@@ -13,12 +13,7 @@ from app.models.user import User
 from app.models.hospital import Hospital
 from app.schemas.user import CommonResponse
 from app.utils.security import get_current_user
-from app.utils.naver_api import (
-    search_animal_hospitals,
-    search_hospitals_with_multiple_queries,
-    calculate_distances_parallel,
-    reverse_geocode,
-)
+from app.utils.naver_api import calculate_distances_parallel
 from app.utils.kakao_api import search_hospitals_kakao
 from app.utils.business_hours import get_today_hours_info
 

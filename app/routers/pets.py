@@ -1,10 +1,11 @@
 """
 반려견 관련 API 라우터
-- POST /pets : 반려견 등록
-- GET /pets : 내 반려견 목록 조회
-- GET /pets/{pet_id} : 반려견 상세 조회
-- PUT /pets/{pet_id} : 반려견 정보 수정
-- (예정) DELETE /pets/{pet_id}
+- POST /pets : 반려견 등록 ✅ 구현 완료
+- GET /pets : 내 반려견 목록 조회 ✅ 구현 완료
+- GET /pets/{pet_id} : 반려견 상세 조회 ✅ 구현 완료
+- PUT /pets/{pet_id} : 반려견 정보 수정 ✅ 구현 완료
+- DELETE /pets/{pet_id} : 반려견 삭제 ✅ 구현 완료
+- POST /pets/{pet_id}/image : 프로필 사진 업로드 ✅ 구현 완료
 """
 
 from app.models.analysis import Analysis
