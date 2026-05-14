@@ -11,7 +11,9 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 
-from app.routers import auth, pets, analyses, favorites, notifications, push, hospitals
+# favorites, notifications, push: 1차 배포 제외, 추후 활성화 예정 (2026-05-13)
+# import는 유지해서 다른 코드에서 참조 가능하도록 함 (라우터 노출만 끊음)
+from app.routers import auth, pets, analyses, favorites, notifications, push, hospitals  # noqa: F401
 
 app = FastAPI(
     title="성신에이전시 백엔드 API",
@@ -85,9 +87,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 app.include_router(auth.router)
 app.include_router(pets.router)
 app.include_router(analyses.router)
-app.include_router(favorites.router)
-app.include_router(notifications.router)
-app.include_router(push.router)
+# 1차 배포 제외, 추후 활성화 예정 (2026-05-13) — 즐겨찾기/알림 기능
+# app.include_router(favorites.router)
+# app.include_router(notifications.router)
+# app.include_router(push.router)
 app.include_router(hospitals.router)
 
 # 정적 파일 서빙 (업로드된 이미지 접근용)

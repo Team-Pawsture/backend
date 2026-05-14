@@ -23,7 +23,7 @@ class HospitalItem(BaseModel):
     certifications: list[str] = []
     image_url: Optional[str]
     today_hours: Optional[str]
-    is_open_now: Optional[bool]
+    is_open_now: Optional[str]  # "before_open" | "open" | "closed" | None
 
 
 # ============================================
@@ -41,5 +41,5 @@ class HospitalDetail(BaseModel):
     image_url: Optional[str]
     business_hours: Optional[dict]
     today_hours: Optional[str]
-    is_open_now: Optional[bool]
+    is_open_now: Optional[str]  # "before_open" | "open" | "closed" | None
     distance_meters: Optional[int]

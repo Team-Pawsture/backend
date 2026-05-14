@@ -8,15 +8,18 @@
 - POST /pets/{pet_id}/image : 프로필 사진 업로드 ✅ 구현 완료
 """
 
+from datetime import date
+from typing import Optional
+
 from app.models.analysis import Analysis
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
 from app.models.pet import Pet
-from app.schemas.pet import PetCreateRequest, PetUpdateRequest
+from app.schemas.pet import PetUpdateRequest, DogBreed, Gender, MedicalHistory
 from app.schemas.user import CommonResponse
 from app.utils.security import get_current_user
 from app.utils.file_handler import (
@@ -24,35 +27,80 @@ from app.utils.file_handler import (
     save_pet_image,
     delete_pet_image,
 )
+from app.utils.url_helper import build_absolute_url
 
 
 router = APIRouter(prefix="/pets", tags=["반려견"])
 
 
 @router.post("", response_model=CommonResponse, status_code=status.HTTP_200_OK)
-def create_pet(
-    request: PetCreateRequest,
+async def create_pet(
+    name: str = Form(..., min_length=1, max_length=20, description="강아지 이름"),
+    birth_date: date = Form(..., description="생년월일 (YYYY-MM-DD)"),
+    breed: DogBreed = Form(..., description="견종 (16종 + 기타)"),
+    gender: Gender = Form(..., description="성별 (male/female)"),
+    medical_history: MedicalHistory = Form(..., description="과거 병력 (6개 enum)"),
+    weight: Optional[float] = Form(None, gt=0, description="체중 kg (선택)"),
+    image: Optional[UploadFile] = File(None, description="프로필 사진 (선택, jpg/jpeg/png, 10MB 이하)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    반려견 등록
+    반려견 등록 (multipart/form-data)
     - JWT 토큰에서 user_id 자동 추출
     - 한 사용자가 여러 마리 등록 가능
+    - 이미지는 선택. 첨부 시 함께 저장. 없으면 profile_image_url = None
+    - 이미지 검증 실패 시 등록 자체 롤백 (정합성 보장)
     """
+    # 0. 이미지 첨부 여부 판단 (UploadFile은 항상 객체가 옴 — filename 비어있으면 미첨부)
+    has_image = image is not None and bool(image.filename)
+
+    # 1. 이미지 첨부됐다면 확장자만 사전 검증 (Pet 생성 전 빠른 실패)
+    if has_image and not is_allowed_extension(image.filename):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "isSuccess": False,
+                "code": "COMMON400",
+                "message": "지원하지 않는 파일 형식입니다. (jpg, jpeg, png 만 가능)",
+                "result": None
+            }
+        )
+
+    # 2. Pet 생성 → pet_id 확보 (이미지 저장 시 필요)
     new_pet = Pet(
         user_id=current_user.user_id,
-        name=request.name,
-        birth_date=request.birth_date,
-        breed=request.breed,
-        gender=request.gender,
-        weight=request.weight,
-        medical_history=request.medical_history
+        name=name,
+        birth_date=birth_date,
+        breed=breed,
+        gender=gender,
+        weight=weight,
+        medical_history=medical_history
     )
     db.add(new_pet)
     db.commit()
     db.refresh(new_pet)
-    
+
+    # 3. 이미지 저장 (실패 시 방금 만든 Pet 롤백)
+    if has_image:
+        try:
+            saved_url = await save_pet_image(new_pet.pet_id, image)
+        except ValueError as e:
+            db.delete(new_pet)
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "isSuccess": False,
+                    "code": "COMMON400",
+                    "message": str(e),
+                    "result": None
+                }
+            )
+        new_pet.profile_image_url = saved_url
+        db.commit()
+        db.refresh(new_pet)
+
     return CommonResponse(
         isSuccess=True,
         code="COMMON200",
@@ -65,7 +113,7 @@ def create_pet(
             "gender": new_pet.gender,
             "weight": new_pet.weight,
             "medical_history": new_pet.medical_history,
-            "profile_image_url": new_pet.profile_image_url,
+            "profile_image_url": build_absolute_url(new_pet.profile_image_url),
             "created_at": new_pet.created_at.isoformat()
         }
     )
@@ -95,7 +143,7 @@ def get_my_pets(
                 "breed": pet.breed,
                 "gender": pet.gender,
                 "weight": pet.weight,
-                "profile_image_url": pet.profile_image_url
+                "profile_image_url": build_absolute_url(pet.profile_image_url)
             }
             for pet in pets
         ]
@@ -175,7 +223,7 @@ def get_pet_detail(
             "gender": pet.gender,
             "weight": pet.weight,
             "medical_history": pet.medical_history,
-            "profile_image_url": pet.profile_image_url,
+            "profile_image_url": build_absolute_url(pet.profile_image_url),
             "created_at": pet.created_at.isoformat(),
             "latest_analysis": latest_analysis  # ⭐ 추가
         }
@@ -238,7 +286,7 @@ def update_pet(
             "gender": pet.gender,
             "weight": pet.weight,
             "medical_history": pet.medical_history,
-            "profile_image_url": pet.profile_image_url,
+            "profile_image_url": build_absolute_url(pet.profile_image_url),
             "created_at": pet.created_at.isoformat()
         }
     )
@@ -388,6 +436,6 @@ async def upload_pet_image(
         message="프로필 사진이 업로드되었습니다.",
         result={
             "pet_id": pet.pet_id,
-            "profile_image_url": pet.profile_image_url
+            "profile_image_url": build_absolute_url(pet.profile_image_url)
         }
     )

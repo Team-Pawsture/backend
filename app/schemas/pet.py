@@ -39,15 +39,10 @@ Gender = Literal["male", "female"]
 
 
 # ============================================
-# 반려견 등록 요청 (Request Body)
+# 반려견 등록 요청
+# - 2026-05-13 변경: multipart/form-data로 받으면서 PetCreateRequest 제거.
+#   각 필드는 라우터에서 Form(...)으로 직접 검증 (DogBreed/Gender/MedicalHistory Literal 재사용).
 # ============================================
-class PetCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=20, description="강아지 이름")
-    birth_date: date = Field(..., description="생년월일 (YYYY-MM-DD)")
-    breed: DogBreed = Field(..., description="견종 (16종 + 기타)")
-    gender: Gender = Field(..., description="성별 (male/female)")
-    weight: Optional[float] = Field(None, gt=0, description="체중 kg (선택)")
-    medical_history: MedicalHistory = Field(..., description="과거 병력 (6개 enum)")
 
 
 # ============================================

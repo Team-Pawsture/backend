@@ -21,6 +21,10 @@ from app.utils.business_hours import get_today_hours_info
 router = APIRouter(prefix="/hospitals", tags=["병원 추천"])
 
 
+# 병원 검색 반경 (m). UI에 입력 칸이 없어 고정값 사용.
+DEFAULT_SEARCH_RADIUS = 3000
+
+
 # ============================================
 # 헬퍼: 자체 DB와 네이버 결과 매칭
 # ============================================
@@ -78,7 +82,6 @@ def _match_with_local_db(naver_hospitals: list[dict], db: Session) -> list[dict]
 async def get_hospitals(
     lat: float = Query(..., description="사용자 위도"),
     lng: float = Query(..., description="사용자 경도"),
-    radius: int = Query(3000, ge=100, le=10000, description="반경(m), 기본 3000"),
     sort: str = Query("distance", description="distance(기본)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -90,12 +93,12 @@ async def get_hospitals(
     """
     try:
         # 1. 카카오 로컬 검색으로 동물병원 가져오기 (위치 기반, 최대 45개)
-        kakao_hospitals = await search_hospitals_kakao(lat=lat, lng=lng, radius=radius)
-        
+        kakao_hospitals = await search_hospitals_kakao(lat=lat, lng=lng, radius=DEFAULT_SEARCH_RADIUS)
+
         # 2. 반경 필터링 (카카오가 이미 반경 안만 주지만 안전망으로 한 번 더)
         filtered = [
             h for h in kakao_hospitals
-            if _haversine_distance(lat, lng, h["latitude"], h["longitude"]) <= radius
+            if _haversine_distance(lat, lng, h["latitude"], h["longitude"]) <= DEFAULT_SEARCH_RADIUS
         ]
         
         # 3. 실제 운전 거리 계산 (네이버 Directions API 병렬 호출)
