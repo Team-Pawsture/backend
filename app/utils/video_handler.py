@@ -13,7 +13,7 @@ from fastapi import UploadFile
 # ============================================
 # 설정값
 # ============================================
-ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov"}
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
 MAX_VIDEO_SIZE = 100 * 1024 * 1024  # 100MB
 VIDEO_UPLOAD_DIR = Path("uploads/analysis_videos")
 

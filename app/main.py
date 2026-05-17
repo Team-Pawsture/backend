@@ -65,13 +65,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     Pydantic 유효성 검사 실패 시 명세서 포맷으로 반환
     - 422 → 400으로 변경 (명세서 기준)
     - 필드별 에러 메시지를 result에 담음
+    - validation_messages.translate_error() 로 한글 매핑 시도, 없으면 Pydantic 영어 fallback
     """
+    from app.utils.validation_messages import translate_error
+
     errors = {}
     for err in exc.errors():
         # loc 예: ('body', 'username') → 'username'
-        field = err["loc"][-1] if len(err["loc"]) > 0 else "unknown"
-        errors[str(field)] = err["msg"]
-    
+        field = str(err["loc"][-1]) if err.get("loc") else "unknown"
+        ko_msg = translate_error(err)
+        errors[field] = ko_msg if ko_msg is not None else err.get("msg", "")
+
     return JSONResponse(
         status_code=400,
         content={

@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.user import User
 from app.schemas.user import UserSignupRequest, UserLoginRequest, CommonResponse
 from app.utils.security import hash_password, verify_password, create_access_token, get_current_user
+from app.utils.datetime_helper import to_kst_iso
 
 
 router = APIRouter(prefix="/auth", tags=["인증"])
@@ -115,6 +116,6 @@ def get_me(current_user: User = Depends(get_current_user)):
         result={
             "user_id": current_user.user_id,
             "username": current_user.username,
-            "created_at": current_user.created_at.isoformat()
+            "created_at": to_kst_iso(current_user.created_at)
         }
     )

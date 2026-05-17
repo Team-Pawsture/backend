@@ -1,47 +1,77 @@
 """
 프로젝트 전역 상수 정의
 - enum 옵션 (견종, 병력, 성별)
-- schemas/pet.py에서 import해서 사용
+- 2026-05-17 변경: 영문 대문자 enum 적용 (명세서 기준)
+  · 견종 17종 + OTHER
+  · 병력 9개 (다중 선택)
+  · 성별 MALE / FEMALE
 """
 
 # ============================================
-# 견종 enum (16종 + 기타)
-# - 슬개골 탈구 위험견 위주로 선정
+# 견종 enum (17종 + OTHER)
+# - 소형견 12종 + 중소형견 5종 + OTHER
 # ============================================
 DOG_BREEDS = [
-    # 소형견 (슬개골 탈구 최고 위험군)
-    "포메라니안",
-    "말티즈",
-    "토이푸들",
-    "미니어처푸들",
-    "치와와",
-    "요크셔테리어",
-    "시츄",
-    "비숑프리제",
-    "페키니즈",
-    "미니핀",
-    "빠삐용",
-    "코카스파니엘",
-    # 중소형견
-    "보스턴테리어",
-    "잭러셀테리어",
-    "닥스훈트",
-    "프렌치불독",
+    # 소형견 (12종)
+    "POMERANIAN",
+    "MALTESE",
+    "TOY_POODLE",
+    "MINIATURE_POODLE",
+    "CHIHUAHUA",
+    "YORKSHIRE_TERRIER",
+    "SHIH_TZU",
+    "BICHON_FRISE",
+    "PEKINGESE",
+    "MINIATURE_PINSCHER",
+    "PAPILLON",
+    "COCKER_SPANIEL",
+    # 중소형견 (5종)
+    "BOSTON_TERRIER",
+    "JACK_RUSSELL_TERRIER",
+    "DACHSHUND",
+    "FRENCH_BULLDOG",
+    "PUG",
     # 기타
-    "기타",
+    "OTHER",
 ]
 
 
 # ============================================
-# 과거 병력 enum (6개 카테고리)
+# 슬개골 탈구 고위험 견종 (병원 추천 점수 가중치용)
+# - 명세서 POST /hospitals/recommend 점수 기준
+# ============================================
+HIGH_RISK_BREEDS = {
+    "POMERANIAN",
+    "MALTESE",
+    "CHIHUAHUA",
+    "TOY_POODLE",
+    "MINIATURE_POODLE",
+    "YORKSHIRE_TERRIER",
+    "SHIH_TZU",
+    "BICHON_FRISE",
+    "PEKINGESE",
+    "MINIATURE_PINSCHER",
+    "PAPILLON",
+    "DACHSHUND",
+    "PUG",
+}
+
+
+# ============================================
+# 과거 병력 enum (9개, 다중 선택)
+# - NONE 선택 시 다른 항목 동시 선택 불가
+# - OTHER 선택 시 medical_history_etc 필수
 # ============================================
 MEDICAL_HISTORY_OPTIONS = [
-    "없음",
-    "슬개골 탈구 이력 있음",
-    "슬개골 수술 경험 있음",
-    "관절 질환 (슬개골 외)",
-    "근육/인대 부상 이력",
-    "기타",
+    "NONE",
+    "PATELLA_LUXATION_DIAGNOSED",
+    "PATELLA_SURGERY",
+    "HIP_DYSPLASIA",
+    "CRUCIATE_LIGAMENT_INJURY",
+    "DISC",
+    "ARTHRITIS",
+    "OBESITY",
+    "OTHER",
 ]
 
 
@@ -49,8 +79,8 @@ MEDICAL_HISTORY_OPTIONS = [
 # 성별 enum
 # ============================================
 GENDER_OPTIONS = [
-    "male",   # 화면 표시: "남아"
-    "female", # 화면 표시: "여아"
+    "MALE",
+    "FEMALE",
 ]
 
 

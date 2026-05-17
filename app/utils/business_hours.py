@@ -2,6 +2,7 @@
 영업시간 처리 유틸리티
 - "오늘 영업시간" 추출
 - "지금 영업 상태" 판단 (3단계: before_open / open / closed)
+- 명세서: 휴무일도 is_open_now="closed", today_hours=null
 """
 
 from datetime import datetime
@@ -25,9 +26,12 @@ def get_today_hours_info(business_hours: Optional[dict]) -> tuple[Optional[str],
 
     Returns:
         (today_hours, is_open_now)
-        - today_hours: "09:00-18:30" | "휴무" | None
+        - today_hours: "09:00-18:30" | None
         - is_open_now: "before_open" | "open" | "closed" | None
-          (영업시간 정보가 없거나 휴무일이면 None)
+          · "before_open": 오늘 영업일이지만 아직 시작 전
+          · "open": 현재 영업 중
+          · "closed": 영업 종료 후 또는 오늘 휴무일
+          · None: 영업시간 정보 자체가 없음
     """
     if not business_hours:
         return (None, None)
@@ -39,9 +43,9 @@ def get_today_hours_info(business_hours: Optional[dict]) -> tuple[Optional[str],
     if not today_info:
         return (None, None)
 
-    # 휴무일 — 영업 시작/종료 시각이 없으므로 status는 None
+    # 휴무일 — 명세서: is_open_now="closed", today_hours=null
     if today_info.get("closed"):
-        return ("휴무", None)
+        return (None, "closed")
 
     open_str = today_info.get("open")
     close_str = today_info.get("close")
