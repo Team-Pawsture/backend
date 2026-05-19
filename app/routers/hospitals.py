@@ -187,6 +187,10 @@ def get_hospital_detail(
             "today_hours": today_hours,
             "is_open_now": is_open_now,
             "distance_meters": distance_meters,
+            # 자체 DB hospital의 카카오 place_url은 보유하지 않음 → null.
+            # 프론트가 GET /hospitals 응답의 map_url 을 캐시해서 사용 권장.
+            # BL-1(병원 seed 확대) 해소 시 hospitals 테이블에 컬럼 추가 검토.
+            "map_url": None,
         },
     )
 

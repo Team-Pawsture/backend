@@ -125,6 +125,23 @@ async def search_hospitals_kakao(
             "latitude": latitude,
             "longitude": longitude,
             "kakao_distance": distance,
+            # 카카오 place 상세 URL (프론트 길찾기 진입용).
+            # 카카오가 http:// 로 주므로 https:// 로 정규화 — 운영 HTTPS 환경의 Mixed Content 차단 / 모바일 차단 회피.
+            "map_url": _normalize_kakao_url(doc.get("place_url")),
         })
     
     return results
+
+
+# ============================================
+# 내부 헬퍼
+# ============================================
+def _normalize_kakao_url(url: str | None) -> str | None:
+    """
+    카카오 place_url 정규화.
+    - 카카오는 'http://place.map.kakao.com/{id}' 형식으로 제공
+    - 운영 HTTPS 환경에서 Mixed Content 경고 / 모바일 차단 회피 위해 https 로 치환
+    """
+    if not url:
+        return None
+    return url.replace("http://", "https://", 1)
