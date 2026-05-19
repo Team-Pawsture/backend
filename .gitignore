@@ -6,7 +6,7 @@ __pycache__/
 *.pyd
 .Python
 
-# 환경변수 - 절대 커밋 X 🚨
+# 환경변수 - 절대 커밋 X 
 .env
 .env.local
 .env.*.local
@@ -52,3 +52,17 @@ uploads/
 
 # VAPID keys
 *.pem
+
+# 업로드 파일 (개발 중 임시)
+uploads/
+
+# Alembic (DB 마이그레이션 캐시)
+alembic/__pycache__/
+
+# 테스트 영상 파일 (P8 실연동 검증용, 저작권 보호)
+test_*.mp4
+*.mov
+*.avi
+
+# pytest 캐시
+.pytest_cache/

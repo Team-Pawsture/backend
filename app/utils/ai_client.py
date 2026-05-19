@@ -149,6 +149,64 @@ async def submit_analysis(video_file_path: str) -> dict:
 
 
 # ============================================
+# 2b. 관절 키포인트 조회 (P7, 2026-05-19)
+# - AI: GET /api/v1/patella/jobs/{job_id}/keypoints
+# - 백엔드는 그대로 프록시 (응답 변환 최소화)
+# - 호출자: 라우터 GET /analyses/{analysis_id}/keypoints
+# ============================================
+
+# 백엔드 → AI 호출 시 고정 쿼리값. AI 명세서 원문 표기(camelCase) 따름.
+# - AI 응답 본문은 snake_case이지만 쿼리 파라미터는 camelCase로 받음.
+_KEYPOINTS_FIXED_PARAMS = {
+    "coordinateType": "normalized",
+    "minConfidence": 0,
+    # maxFrames 미설정 (전체 프레임 반환)
+}
+
+AI_KEYPOINTS_TIMEOUT_SEC = 30
+
+
+async def fetch_keypoints(job_id: str) -> dict:
+    """
+    AI 서버에서 job_id 의 키포인트 시계열 조회.
+    응답 JSON 그대로 반환 (변환 X).
+
+    Raises:
+        AIServerUnavailable: 환경변수 미설정, 타임아웃, 4xx/5xx, 네트워크 오류
+    """
+    if AI_MOCK_MODE:
+        return _mock_fetch_keypoints(job_id)
+
+    if not AI_SERVER_URL:
+        raise AIServerUnavailable("AI_SERVER_URL 환경변수가 설정되지 않았습니다")
+
+    url = f"{AI_SERVER_URL}/api/v1/patella/jobs/{job_id}/keypoints"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=AI_KEYPOINTS_TIMEOUT_SEC)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, params=_KEYPOINTS_FIXED_PARAMS) as response:
+                if response.status == 404:
+                    raise AIServerUnavailable(f"AI job {job_id} 키포인트 없음")
+                if response.status >= 500:
+                    body_text = await _safe_text(response)
+                    raise AIServerUnavailable(
+                        f"AI 서버 오류 {response.status}: {body_text[:200]}"
+                    )
+                if response.status >= 400:
+                    body = await _safe_json(response)
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                    raise AIServerUnavailable(
+                        f"AI 키포인트 거절 {response.status}: {detail or '알 수 없는 오류'}"
+                    )
+                return await response.json()
+    except asyncio.TimeoutError:
+        raise AIServerUnavailable(f"AI 키포인트 타임아웃 ({AI_KEYPOINTS_TIMEOUT_SEC}초)")
+    except aiohttp.ClientError as e:
+        raise AIServerUnavailable(f"AI 키포인트 네트워크 오류: {e}")
+
+
+# ============================================
 # 2. 분석 상태/결과 조회 (사후 재조회용)
 # - 현재 흐름에서는 거의 호출되지 않음.
 #   submit_analysis()가 이미 completed 결과를 반환하므로 DB 캐시로 충분.
@@ -217,6 +275,18 @@ def _transform_ai_to_backend(ai_resp: dict) -> dict:
             "confidence": _max_probability(ai_prediction.get("probabilities")),
             # TODO(AI팀 매핑 확정): AI 3종(high_risk/suspicious/abnormal) vs 명세 5단계(normal/stage1~4)
             "class_probabilities": None,
+            # ── 2026-05-18 P5: 확장 필드 (AI 응답 새 키 그대로 전달) ──
+            # bool 플래그는 명시적 변환 (AI가 truthy/falsy 줄 가능성 대비)
+            "is_uncertain": bool(ai_prediction.get("is_uncertain")),
+            "is_high_risk": bool(ai_prediction.get("is_high_risk")),
+            # user_message는 prediction 안에도 노출 (기존 recommendation.summary 와 동일 소스이지만
+            # 프론트 UX에서 prediction 카드 안에 표시되는 경우가 있어 중복 제공)
+            "user_message": ai_prediction.get("user_message"),
+            # display_metrics: AI 직접 제공값 우선, 없으면 probabilities 로 derive.
+            #   포함 키: suspicious_signal_score, abnormal_signal_score,
+            #            analysis_confidence_score, analysis_confidence_level
+            #   AI 미제공 시 분기는 _build_display_metrics() 참고. BL-8.
+            "display_metrics": _build_display_metrics(ai_prediction),
         }
 
     # ---- recommendation ----
@@ -332,7 +402,20 @@ def _mock_submit() -> dict:
                     "prob_target_suspicious": 0.45,
                     "prob_target_abnormal": 0.20,
                 },
+                # P5: AI 응답 확장 필드 (실제 AI가 보낼 형식 가정)
+                "is_uncertain": False,
+                "is_high_risk": False,
                 "user_message": "보행 중 후지 움직임에 비대칭이 관찰되어 슬개골 이상 보행 가능성이 있습니다. 증상이 반복되거나 다리를 들거나 핥는 행동이 보이면 동물병원 검진을 권장합니다.",
+                "display_metrics": {
+                    # 필요 필드 (백엔드가 응답에 노출). AI 명세상 모두 0~100 스케일.
+                    "suspicious_signal_score": 45.0,
+                    "abnormal_signal_score": 20.0,
+                    "analysis_confidence_score": 78.0,
+                    "analysis_confidence_level": "medium",
+                    # 노출 제외 필드 (filter 검증용으로 일부러 포함)
+                    "score_unit": "percent",
+                    "analysis_confidence_source": "probabilities_max",
+                },
                 "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
             },
             "quality": {
@@ -349,6 +432,105 @@ def _mock_submit() -> dict:
 
 def _mock_poll(job_id: str) -> dict:
     return _mock_submit()
+
+
+# ============================================
+# Mock 키포인트 — AI 서버 없이 프론트 스켈레톤 애니메이션 테스트용
+# - AI 명세서 예시 구조 그대로: joints 12개, edges 11개, frames 3개
+# - 응답 변환 X 라 ai_client._transform_ai_to_backend 미적용
+# ============================================
+_MOCK_JOINTS = [
+    {"id": "ear", "label": "Ear", "model_name": "Ear"},
+    {"id": "t13_spinous_process", "label": "T13 Spinous Process", "model_name": "T13 Spinous precess"},
+    {"id": "dorsal_scapular_spine", "label": "Dorsal Scapular Spine", "model_name": "Dorsal scapular spine"},
+    {"id": "shoulder", "label": "Shoulder", "model_name": "Acromion/Greater tubercle"},
+    {"id": "elbow", "label": "Elbow", "model_name": "Lateral humeral epicondyle"},
+    {"id": "wrist", "label": "Wrist", "model_name": "Ulnar styloid process"},
+    {"id": "front_paw", "label": "Front Paw", "model_name": "Distal lateral aspect of fifth metacarpal bone"},
+    {"id": "iliac_crest", "label": "Iliac Crest", "model_name": "Iliac crest"},
+    {"id": "hip", "label": "Hip", "model_name": "Femoral greater trochanter"},
+    {"id": "knee", "label": "Knee", "model_name": "Femorotibial joint"},
+    {"id": "hock", "label": "Hock", "model_name": "Lateral malleolus of the distal tibia"},
+    {"id": "hind_paw", "label": "Hind Paw", "model_name": "Distal lateral aspect of the fifth metatarsus"},
+]
+
+_MOCK_EDGES = [
+    ["ear", "dorsal_scapular_spine"],
+    ["dorsal_scapular_spine", "t13_spinous_process"],
+    ["t13_spinous_process", "iliac_crest"],
+    ["dorsal_scapular_spine", "shoulder"],
+    ["shoulder", "elbow"],
+    ["elbow", "wrist"],
+    ["wrist", "front_paw"],
+    ["iliac_crest", "hip"],
+    ["hip", "knee"],
+    ["knee", "hock"],
+    ["hock", "hind_paw"],
+]
+
+
+def _mock_frame(frame_index: int, time_sec: float, x_shift: float) -> dict:
+    """프레임 1개 생성. x_shift 로 좌→우 이동 시뮬레이션."""
+    base = {
+        "ear":                  (0.355 + x_shift, 0.380, 0.97),
+        "t13_spinous_process":  (0.418 + x_shift, 0.343, 0.93),
+        "dorsal_scapular_spine": (0.438 + x_shift, 0.395, 0.97),
+        "shoulder":             (0.450 + x_shift, 0.437, 0.98),
+        "elbow":                (0.460 + x_shift, 0.470, 0.98),
+        "wrist":                (0.458 + x_shift, 0.525, 0.97),
+        "front_paw":            (0.466 + x_shift, 0.540, 0.97),
+        "iliac_crest":          (0.455 + x_shift, 0.350, 0.95),
+        "hip":                  (0.466 + x_shift, 0.387, 0.94),
+        "knee":                 (0.456 + x_shift, 0.462, 0.96),
+        "hock":                 (0.460 + x_shift, 0.500, 0.94),
+        "hind_paw":             (0.465 + x_shift, 0.518, 0.92),
+    }
+    return {
+        "frame_index": frame_index,
+        "time_sec": time_sec,
+        "keypoints": {
+            joint: {"x": x, "y": y, "confidence": c}
+            for joint, (x, y, c) in base.items()
+        },
+    }
+
+
+def _mock_fetch_keypoints(job_id: str) -> dict:
+    """AI 키포인트 응답 mock. 3프레임 짜리 짧은 시퀀스."""
+    frames = [
+        _mock_frame(frame_index=0, time_sec=0.000, x_shift=0.00),
+        _mock_frame(frame_index=2, time_sec=0.083, x_shift=0.01),
+        _mock_frame(frame_index=4, time_sec=0.167, x_shift=0.02),
+    ]
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "coordinate_type": "normalized",
+        "min_confidence": 0,
+        "video": {
+            "width": 1280,
+            "height": 720,
+            "fps": 24,
+            "duration_sec": 0.25,
+            "total_frames": 6,
+        },
+        "source_segment": {
+            "start_sec": 0,
+            "end_sec": 0.167,
+            "frame_count": 3,
+            "returned_frame_count": 3,
+        },
+        "keypoint_summary": {
+            "valid_frame_count": 3,
+            "avg_confidence": 0.955,
+        },
+        "skeleton": {
+            "joints": _MOCK_JOINTS,
+            "edges": _MOCK_EDGES,
+        },
+        "frames": frames,
+        "is_diagnostic": False,
+    }
 
 
 # ============================================
@@ -369,6 +551,56 @@ def _max_probability(probs):
         return None
     numeric = [v for v in probs.values() if isinstance(v, (int, float))]
     return max(numeric) if numeric else None
+
+
+# 2026-05-18 P5 / 2026-05-19 P8: display_metrics 빌더
+# - 백엔드 응답에 노출할 4개 필드 (score_unit, analysis_confidence_source 등 AI 부가 메타는 제외)
+_DISPLAY_METRICS_KEYS = (
+    "suspicious_signal_score",
+    "abnormal_signal_score",
+    "analysis_confidence_score",
+    "analysis_confidence_level",
+)
+
+
+def _build_display_metrics(ai_pred):
+    """
+    display_metrics 생성. AI 직접 제공값 우선, 없으면 probabilities 에서 derive.
+
+    매핑 근거 (AI 모델 패키지 v3_two_stage_policy_9_5 기준):
+    - suspicious_signal_score = round(prob_target_suspicious * 100, 1)
+    - abnormal_signal_score   = round(prob_target_abnormal * 100, 1)
+    - analysis_confidence_score: AI 모델 패키지가 아직 산출 안 함 → null
+    - analysis_confidence_level: 동일 사유 → "unknown"
+    추후 AI가 display_metrics 를 직접 보내기 시작하면 그 값을 우선 사용
+    (백엔드 derive 는 fallback). 백로그 BL-8 참고.
+    """
+    if not isinstance(ai_pred, dict):
+        return None
+
+    # 1) AI 직접 제공: 4개 필드만 추림 (지금 AI 모델 패키지엔 없음, 향후 대비)
+    ai_metrics = ai_pred.get("display_metrics")
+    if isinstance(ai_metrics, dict):
+        return {key: ai_metrics.get(key) for key in _DISPLAY_METRICS_KEYS}
+
+    # 2) Fallback: AI probabilities 로 derive
+    probs = ai_pred.get("probabilities")
+    if not isinstance(probs, dict):
+        return None
+
+    susp = probs.get("prob_target_suspicious")
+    abn = probs.get("prob_target_abnormal")
+
+    return {
+        "suspicious_signal_score": (
+            round(susp * 100, 1) if isinstance(susp, (int, float)) else None
+        ),
+        "abnormal_signal_score": (
+            round(abn * 100, 1) if isinstance(abn, (int, float)) else None
+        ),
+        "analysis_confidence_score": None,
+        "analysis_confidence_level": "unknown",
+    }
 
 
 def _join_issue_messages(issues: list) -> str:

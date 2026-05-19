@@ -36,6 +36,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     UploadFile,
     status,
 )
@@ -53,8 +54,9 @@ from app.utils.video_handler import (
     save_analysis_video,
     delete_analysis_video,
 )
-from app.utils.ai_client import submit_analysis, AIServerUnavailable
+from app.utils.ai_client import submit_analysis, fetch_keypoints, AIServerUnavailable
 from app.utils.datetime_helper import to_kst_iso
+from app.utils.url_helper import build_absolute_url
 
 
 router = APIRouter(prefix="/analyses", tags=["영상 분석"])
@@ -220,6 +222,145 @@ async def create_analysis(
             "status": new_analysis.status,
             "created_at": to_kst_iso(new_analysis.created_at),
         },
+    )
+
+
+# ============================================
+# GET /analyses/recent — 내 반려견의 최근 completed 분석 목록
+# - /{analysis_id} 보다 먼저 등록되어야 path 매칭됨
+# - 본인 반려견의 completed 상태만, 최신순 정렬
+# ============================================
+@router.get("/recent", response_model=CommonResponse, status_code=status.HTTP_200_OK)
+def get_recent_analyses(
+    limit: int = Query(5, ge=1, le=20, description="조회 개수 (1~20, 기본 5)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    최근 분석 이력
+    - 권한: JWT 토큰에서 user_id 추출, Pet.user_id 와 매칭되는 분석만
+    - 필터: status=completed (queued/running/rejected/failed 제외)
+    - 정렬: Analysis.created_at DESC
+    - 응답 result: 배열. 분석 이력 없으면 빈 배열 []
+    - pet_profile_image_url 은 GET /pets 와 동일하게 BASE_URL 포함 절대 URL
+    """
+    rows = (
+        db.query(Analysis, Pet)
+        .join(Pet, Analysis.pet_id == Pet.pet_id)
+        .filter(
+            Pet.user_id == current_user.user_id,
+            Analysis.status == "completed",
+        )
+        .order_by(Analysis.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    items = [
+        {
+            "analysis_id": analysis.analysis_id,
+            "pet_id": analysis.pet_id,
+            "pet_name": pet.name,
+            "pet_profile_image_url": build_absolute_url(pet.profile_image_url),
+            "status": analysis.status,
+            "risk_level": analysis.risk_level,
+            "created_at": to_kst_iso(analysis.created_at),
+            "completed_at": to_kst_iso(analysis.completed_at),
+        }
+        for analysis, pet in rows
+    ]
+
+    return CommonResponse(
+        isSuccess=True,
+        code="COMMON200",
+        message="성공입니다.",
+        result=items,
+    )
+
+
+# ============================================
+# GET /analyses/{analysis_id}/keypoints — 관절 좌표 시계열 (P7, 2026-05-19)
+# - /{analysis_id} 보다 먼저 등록되어야 path 매칭됨
+# - 프록시 성격: AI 응답을 result에 그대로 담아 반환 (변환 최소화)
+# - completed 분석에서만 호출 가능 (queued/running/rejected/failed → 400 ANALYSIS400)
+# ============================================
+@router.get("/{analysis_id}/keypoints", response_model=CommonResponse, status_code=status.HTTP_200_OK)
+async def get_analysis_keypoints(
+    analysis_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    AI 프레임별 관절 키포인트 시계열 조회.
+    - 권한: 본인 반려견의 분석만
+    - 상태: completed 아니면 400 ANALYSIS400
+    - AI 호출 실패: 503 ANALYSIS503 (기존 패턴 재사용)
+    """
+    analysis = db.query(Analysis).filter(Analysis.analysis_id == analysis_id).first()
+    if not analysis:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "isSuccess": False,
+                "code": "ANALYSIS404",
+                "message": "해당 분석을 찾을 수 없습니다.",
+                "result": None,
+            },
+        )
+
+    pet = db.query(Pet).filter(Pet.pet_id == analysis.pet_id).first()
+    if not pet or pet.user_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "isSuccess": False,
+                "code": "ANALYSIS403",
+                "message": "접근 권한이 없습니다.",
+                "result": None,
+            },
+        )
+
+    if analysis.status != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "isSuccess": False,
+                "code": "ANALYSIS400",
+                "message": "완료된 분석에서만 관절 좌표를 조회할 수 있습니다.",
+                "result": None,
+            },
+        )
+
+    # job_id 없으면 키포인트 조회 불가 (정상 흐름에선 completed면 job_id 존재)
+    if not analysis.job_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "isSuccess": False,
+                "code": "ANALYSIS503",
+                "message": "분석 job_id가 없어 키포인트를 조회할 수 없습니다.",
+                "result": None,
+            },
+        )
+
+    try:
+        keypoints = await fetch_keypoints(analysis.job_id)
+    except AIServerUnavailable as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "isSuccess": False,
+                "code": "ANALYSIS503",
+                "message": f"AI 키포인트 서버를 사용할 수 없습니다. ({e})",
+                "result": None,
+            },
+        )
+
+    return CommonResponse(
+        isSuccess=True,
+        code="COMMON200",
+        message="성공입니다.",
+        result=keypoints,
     )
 
 

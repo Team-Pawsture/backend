@@ -33,6 +33,8 @@ FIELD_KO: dict[str, tuple[str, str]] = {
     # ----- hospitals -----
     "lat": ("위도(lat)", "는"),
     "lng": ("경도(lng)", "는"),
+    # ----- 공통 query params -----
+    "limit": ("limit", "은"),
 }
 
 
@@ -88,6 +90,18 @@ def translate_error(err: dict) -> str | None:
 
     if err_type in ("greater_than", "gt"):
         return f"{label}{particle} 0보다 커야 합니다"
+
+    if err_type in ("greater_than_equal", "ge"):
+        ge = ctx.get("ge")
+        if ge is not None:
+            return f"{label}{particle} {ge} 이상이어야 합니다"
+        return f"{label}{particle} 너무 작습니다"
+
+    if err_type in ("less_than_equal", "le"):
+        le = ctx.get("le")
+        if le is not None:
+            return f"{label}{particle} {le} 이하여야 합니다"
+        return f"{label}{particle} 너무 큽니다"
 
     if err_type in ("int_parsing", "int_type"):
         return f"{label}{particle} 숫자(정수) 형식이어야 합니다"
