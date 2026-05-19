@@ -17,7 +17,8 @@ from app.models.favorite import FavoriteHospital
 from app.schemas.user import CommonResponse
 from app.utils.security import get_current_user
 from app.utils.notification_helper import create_notification
-from app.utils.naver_api import calculate_distances_parallel
+# 2026-05-20 BL-10: 네이버 Directions 호출 제거. favorites 활성화 시 distance_meters 는
+# hospitals.py 의 _haversine_distance 패턴 따라 자체 계산. duration_seconds 응답 노출 안 함.
 from app.utils.business_hours import get_today_hours_info
 
 
@@ -190,7 +191,7 @@ async def get_favorites(
     - 권한 체크: 본인 반려견만 조회 가능
     - 등록 최신순 정렬
     - lat/lng 보내면 실제 운전 거리 계산 (네이버 Directions API)
-    - 영업시간 정보 (today_hours, is_open_now) 자동 포함
+    - 영업시간 정보 (today_hours, operation_status) 자동 포함
     """
     # 1. 반려견 권한 체크 (Pet 객체 반환받음)
     pet = _check_pet_ownership(pet_id, current_user, db)
@@ -208,7 +209,7 @@ async def get_favorites(
     favorite_list = []
     for fav, hosp in favorites:
         # 영업시간 정보 처리
-        today_hours, is_open_now = get_today_hours_info(hosp.business_hours)
+        today_hours, operation_status = get_today_hours_info(hosp.business_hours)
         
         favorite_list.append({
             "favorite_id": fav.favorite_id,
@@ -225,28 +226,15 @@ async def get_favorites(
                 if hosp.certifications else []
             ),
             "today_hours": today_hours,
-            "is_open_now": is_open_now,
-            "distance_meters": None,        # lat/lng 있으면 아래에서 채움
-            "duration_seconds": None,
+            "operation_status": operation_status,
+            "distance_meters": None,        # 활성화 시 Haversine으로 채움
             "added_at": fav.created_at.isoformat()
         })
-    
-    # 4. 사용자 위치 받으면 거리 계산 (네이버 Directions 병렬 호출)
-    if lat is not None and lng is not None and favorite_list:
-        # 거리 계산용 데이터 추출
-        hospitals_for_distance = [
-            {"latitude": f["latitude"], "longitude": f["longitude"]}
-            for f in favorite_list
-        ]
-        
-        # 병렬 호출로 거리 계산
-        with_distances = await calculate_distances_parallel(lat, lng, hospitals_for_distance)
-        
-        # 결과를 favorite_list에 합치기
-        for fav, dist_info in zip(favorite_list, with_distances):
-            fav["distance_meters"] = dist_info["distance_meters"]
-            fav["duration_seconds"] = dist_info["duration_seconds"]
-    
+
+    # 2026-05-20 BL-10: 네이버 Directions 병렬 호출 제거.
+    # favorites 라우터 활성화(BL-3 작업 시점)에 hospitals.py 의 _haversine_distance 패턴 복제하여
+    # lat/lng 인자 받았을 때 distance_meters 자체 계산하도록 채울 것.
+
     return CommonResponse(
         isSuccess=True,
         code="COMMON200",

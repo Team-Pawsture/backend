@@ -31,8 +31,10 @@ from app.models.hospital import Hospital
 from app.schemas.user import CommonResponse
 from app.utils.business_hours import get_today_hours_info
 from app.utils.kakao_api import search_hospitals_kakao
-from app.utils.naver_api import calculate_distances_parallel
 from app.utils.security import get_current_user
+# 2026-05-20: 네이버 Directions 호출 제거(BL-10 완료).
+# distance_meters 는 Haversine 직선 거리로 자체 계산, duration_seconds 응답 노출 안 함.
+# naver_api 모듈 자체는 향후 재활용 대비 보존.
 
 
 router = APIRouter(prefix="/hospitals", tags=["병원 추천"])
@@ -77,16 +79,16 @@ def _match_with_local_db(naver_hospitals: list[dict], db: Session) -> list[dict]
                 else []
             )
             naver_hosp["image_url"] = matched.image_url
-            today_hours, is_open_now = get_today_hours_info(matched.business_hours)
+            today_hours, operation_status = get_today_hours_info(matched.business_hours)
             naver_hosp["today_hours"] = today_hours
-            naver_hosp["is_open_now"] = is_open_now
+            naver_hosp["operation_status"] = operation_status
         else:
             naver_hosp["hospital_id"] = None
             naver_hosp["specialty"] = None
             naver_hosp["certifications"] = []
             naver_hosp["image_url"] = None
             naver_hosp["today_hours"] = None
-            naver_hosp["is_open_now"] = None
+            naver_hosp["operation_status"] = None
 
     return naver_hospitals
 
@@ -157,7 +159,7 @@ def get_hospital_detail(
             },
         )
 
-    today_hours, is_open_now = get_today_hours_info(hospital.business_hours)
+    today_hours, operation_status = get_today_hours_info(hospital.business_hours)
 
     distance_meters = None
     if lat is not None and lng is not None:
@@ -185,7 +187,7 @@ def get_hospital_detail(
             "image_url": hospital.image_url,
             "business_hours": hospital.business_hours,
             "today_hours": today_hours,
-            "is_open_now": is_open_now,
+            "operation_status": operation_status,
             "distance_meters": distance_meters,
             # 자체 DB hospital의 카카오 place_url은 보유하지 않음 → null.
             # 프론트가 GET /hospitals 응답의 map_url 을 캐시해서 사용 권장.
@@ -326,7 +328,7 @@ def _compute_recommend_score(
             score += 10
 
     # 영업중: +10
-    if hosp.get("is_open_now") == "open":
+    if hosp.get("operation_status") == "open":
         score += 10
 
     # 고위험 견종: +10
@@ -355,15 +357,18 @@ async def _build_nearby_hospitals(lat: float, lng: float, db: Session) -> list[d
         lat=lat, lng=lng, radius=DEFAULT_SEARCH_RADIUS
     )
 
-    filtered = [
-        h
-        for h in kakao_hospitals
-        if _haversine_distance(lat, lng, h["latitude"], h["longitude"])
-        <= DEFAULT_SEARCH_RADIUS
-    ]
+    # Haversine 직선 거리로 distance_meters 채우면서 반경 필터링.
+    # 카카오의 kakao_distance 키는 내부용 — 응답에 노출하지 않도록 pop.
+    filtered: list[dict] = []
+    for h in kakao_hospitals:
+        dist = _haversine_distance(lat, lng, h["latitude"], h["longitude"])
+        if dist > DEFAULT_SEARCH_RADIUS:
+            continue
+        h["distance_meters"] = int(dist)
+        h.pop("kakao_distance", None)
+        filtered.append(h)
 
-    with_distances = await calculate_distances_parallel(lat, lng, filtered)
-    merged = _match_with_local_db(with_distances, db)
+    merged = _match_with_local_db(filtered, db)
 
     merged.sort(
         key=lambda h: h["distance_meters"] if h["distance_meters"] is not None else float("inf")
