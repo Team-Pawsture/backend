@@ -187,27 +187,14 @@
 
 ---
 
-## BL-7 · CORS `allow_origins` 운영 도메인 제한
+## BL-7 · CORS `allow_origins` 운영 도메인 제한 — ✅ 완료 (2026-05-20)
 
-**우선순위**: P0
-**트리거**: 운영 배포 차단 요소. 프론트 도메인이 확정되면 즉시 적용 — 절대 와일드카드(`*`)로 배포 금지.
-**발견 시점**: 2026-05-18 (전체 작업 정리 중)
+**처리**: `app/main.py` 의 `allow_origins=["*"]` → 환경변수 `CORS_ALLOWED_ORIGINS` 기반 콤마 구분 리스트로 전환. 기본값 `http://localhost:3000,https://pawsture.vercel.app`. 차단 origin 은 preflight 에 `400 Bad Request` 반환 + `access-control-allow-origin` 헤더 미포함 동작 확인.
 
-**현황**
-- `app/main.py:27-32` 의 CORS 설정이 개발 편의상 `allow_origins=["*"]`
-- `allow_credentials=True` 와 `allow_origins=["*"]` 조합은 브라우저가 차단(스펙상)하지만, 인증 토큰 노출 등 보안 표면이 넓어짐
-
-**영향**
-- 임의 도메인에서 API 호출 가능 → 토큰 탈취 시 다른 도메인에서도 사용 가능
-- 1차 배포 시점부터 HTTPS와 같이 잠가야 함 (배포 후 변경은 회귀 위험 큼)
-
-**후보 액션**
-- 프론트 운영 도메인 확정 후 `allow_origins=["https://www.pasture.com", "https://pasture.com"]` 등으로 명시
-- 개발/스테이징은 환경변수 `CORS_ORIGINS` 로 분리하면 더 안전
-- 배포 PR 체크리스트에 "CORS 제한 확인" 항목 추가
-
-**관련 코드**
-- `app/main.py:27-32` (CORS 미들웨어 등록)
+**추가 메모 (프론트 도메인 확장 시)**
+- 새 프론트 도메인이 생기면 `.env` 의 `CORS_ALLOWED_ORIGINS` 에 콤마로 추가 후 서버 재기동
+- 백엔드 자체 도메인(예: `dajeong.shop`)은 origin 이 아니라 destination 이므로 등록 불필요
+- AI 서버(`https://ai.dajeong.shop`)도 백엔드 → AI 서버 간 호출이라 server-to-server, CORS 무관
 
 ---
 

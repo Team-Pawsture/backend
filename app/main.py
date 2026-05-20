@@ -5,6 +5,8 @@ FastAPI 애플리케이션 진입점
 - 전역 예외 핸들러 (응답 포맷 통일)
 """
 
+import os
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -22,10 +24,21 @@ app = FastAPI(
 )
 
 
-# CORS 설정 (프론트엔드와 통신할 수 있도록)
+# CORS 설정 — 프론트 도메인만 허용 (BL-7 완료, 2026-05-20)
+# 환경변수 CORS_ALLOWED_ORIGINS 콤마 구분. 미설정 시 로컬+vercel 기본값 사용.
+# 새 프론트 도메인 추가는 .env 한 줄 변경 + 서버 재기동만 필요.
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:3000,https://pawsture.vercel.app",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 단계는 전체 허용, 배포 시 도메인 제한 필요
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
