@@ -112,6 +112,10 @@ app.include_router(hospitals.router)
 
 # 정적 파일 서빙 (업로드된 이미지 접근용)
 # /uploads/pet_profiles/xxx.jpg 로 접근 가능
+# uploads/ 는 .gitignore 대상이라 신규 환경(Render 등)에는 존재하지 않음 → mount 전에 자동 생성.
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("uploads/pet_profiles", exist_ok=True)
+os.makedirs("uploads/analysis_videos", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
