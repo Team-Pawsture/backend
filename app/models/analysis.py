@@ -18,7 +18,10 @@ class Analysis(Base):
 
     analysis_id = Column(BigInteger, primary_key=True, autoincrement=True)
     pet_id = Column(BigInteger, ForeignKey("pets.pet_id", ondelete="CASCADE"), nullable=False)
-    video_url = Column(String(500), nullable=False, comment="업로드된 영상 URL")
+    video_url = Column(String(500), nullable=False, comment="업로드된 영상 URL (Phase 2부터는 videos.file_url 복사값)")
+    # Phase 2 (2026-05-22): videos 테이블 분리 후 FK 도입. 기존 row 호환 위해 nullable.
+    # 새 INSERT 는 항상 채워짐. 기존 row(id <= phase2 적용 직전 max)는 NULL.
+    video_id = Column(BigInteger, ForeignKey("videos.video_id", ondelete="SET NULL"), nullable=True)
     job_id = Column(String(100), nullable=True, comment="AI 서버에서 발급한 job ID")
     status = Column(
         String(20),
