@@ -30,8 +30,8 @@ from app.schemas.pet import PetUpdateRequest, DogBreed, Gender
 from app.schemas.user import CommonResponse
 from app.utils.security import get_current_user
 from app.utils.file_handler import is_allowed_extension, save_pet_image
-from app.utils.url_helper import build_absolute_url
 from app.utils.datetime_helper import to_kst_iso
+# 2026-05-22 URL 정책 반전: 응답은 상대경로 그대로. build_absolute_url 사용 안 함.
 from app.constants import MEDICAL_HISTORY_OPTIONS
 
 
@@ -238,7 +238,7 @@ async def create_pet(
             "weight": new_pet.weight,
             "medical_history": new_pet.medical_history,
             "medical_history_etc": new_pet.medical_history_etc,
-            "profile_image_url": build_absolute_url(new_pet.profile_image_url),
+            "profile_image_url": new_pet.profile_image_url,
             "created_at": to_kst_iso(new_pet.created_at),
         },
     )
@@ -271,7 +271,7 @@ def get_my_pets(
                 "breed": pet.breed,
                 "gender": pet.gender,
                 "weight": pet.weight,
-                "profile_image_url": build_absolute_url(pet.profile_image_url),
+                "profile_image_url": pet.profile_image_url,
             }
             for pet in pets
         ],
@@ -358,7 +358,7 @@ def get_pet_detail(
             "weight": pet.weight,
             "medical_history": pet.medical_history,
             "medical_history_etc": pet.medical_history_etc,
-            "profile_image_url": build_absolute_url(pet.profile_image_url),
+            "profile_image_url": pet.profile_image_url,
             "created_at": to_kst_iso(pet.created_at),
             "latest_analysis": latest_analysis,
         },
@@ -448,7 +448,7 @@ def update_pet(
             "weight": pet.weight,
             "medical_history": pet.medical_history,
             "medical_history_etc": pet.medical_history_etc,
-            "profile_image_url": build_absolute_url(pet.profile_image_url),
+            "profile_image_url": pet.profile_image_url,
             "created_at": to_kst_iso(pet.created_at),
         },
     )

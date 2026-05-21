@@ -48,6 +48,8 @@ from pathlib import Path
 
 import aiohttp
 
+from app.utils.url_helper import build_absolute_url
+
 
 # ============================================
 # 환경 변수
@@ -111,13 +113,18 @@ async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
 
     url = f"{AI_SERVER_URL}/api/v1/patella/analyze"
 
+    # URL 정책 반전(2026-05-22): 라우터에서 받은 video_url 은 상대경로일 수 있음.
+    # AI 서버는 HTTP GET 다운로드 필요 → 절대 URL 로 변환.
+    # build_absolute_url 은 http(s):// 로 시작하면 그대로 통과(이중 prefix 방지) → 기존 DB 절대 URL row 도 안전.
+    absolute_video_url = build_absolute_url(video_url)
+
     try:
         timeout = aiohttp.ClientTimeout(total=AI_ANALYZE_TIMEOUT_SEC)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             form = aiohttp.FormData()
             form.add_field("pet_id", str(pet_id))
             form.add_field("video_id", str(video_id))
-            form.add_field("video_url", video_url)
+            form.add_field("video_url", absolute_video_url)
             async with session.post(url, data=form) as response:
                 if response.status >= 500:
                     body_text = await _safe_text(response)

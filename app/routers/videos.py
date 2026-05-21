@@ -23,7 +23,7 @@ from app.models.video import Video
 from app.schemas.user import CommonResponse
 from app.utils.datetime_helper import to_kst_iso
 from app.utils.security import get_current_user
-from app.utils.url_helper import build_absolute_url
+# 2026-05-22 URL 정책 반전: DB / 응답 모두 상대경로 저장. AI 호출 시 절대 URL 변환은 ai_client 내부.
 
 
 router = APIRouter(prefix="/videos", tags=["영상 업로드"])
@@ -158,8 +158,9 @@ async def upload_video(
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    url_path = f"/uploads/videos/{safe_filename}"
-    absolute_url = build_absolute_url(url_path)
+    # 응답 + DB 모두 상대경로 (URL 정책 반전). 프론트가 도메인 prefix 부착.
+    # AI 서버 호출 시점에만 ai_client 가 BASE_URL 붙여 절대 URL 로 변환.
+    relative_url = f"/uploads/videos/{safe_filename}"
 
     # 5. DB row 생성
     # client 가 잘못된 content_type 보내거나(application/octet-stream 등) 비어있으면
@@ -173,7 +174,7 @@ async def upload_video(
         pet_id=pet.pet_id,
         user_id=current_user.user_id,
         file_path=str(file_path),
-        file_url=absolute_url,
+        file_url=relative_url,
         file_size=file_size,
         mime_type=resolved_mime,
     )

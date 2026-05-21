@@ -51,7 +51,7 @@ from app.schemas.video import AnalysisCreateRequest
 from app.utils.security import get_current_user
 from app.utils.ai_client import submit_analysis, fetch_keypoints, AIServerUnavailable
 from app.utils.datetime_helper import to_kst_iso
-from app.utils.url_helper import build_absolute_url
+# 2026-05-22 URL 정책 반전: 응답은 상대경로. AI 호출 시 절대 URL 변환은 ai_client 내부 처리.
 
 
 router = APIRouter(prefix="/analyses", tags=["영상 분석"])
@@ -245,7 +245,7 @@ def get_recent_analyses(
             "analysis_id": analysis.analysis_id,
             "pet_id": analysis.pet_id,
             "pet_name": pet.name,
-            "pet_profile_image_url": build_absolute_url(pet.profile_image_url),
+            "pet_profile_image_url": pet.profile_image_url,
             "status": analysis.status,
             "risk_level": analysis.risk_level,
             "created_at": to_kst_iso(analysis.created_at),
