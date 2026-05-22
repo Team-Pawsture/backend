@@ -1,24 +1,12 @@
 """
 AI 분석 서버 클라이언트
-- AI 서버 명세 v3: POST /api/v1/patella/analyze (동기, 평균 34초/최대 72초)
-                  GET  /api/v1/patella/jobs/{jobId}
-- 호출 흐름: 백엔드 라우터가 BackgroundTasks로 submit_analysis() 실행 → 결과를 DB 업데이트
-- AI가 동기 호출이라 submit_analysis() 한 번으로 completed/rejected 결과를 받음.
-  poll_analysis()는 사후 재조회용으로만 유지 (현재 흐름에선 거의 사용 안 함).
-
-────────────────────────────────────────────────────────────────────────────
-⚠ BackgroundTasks 한계 (analyses.py 라우터에서 함께 적용)
-────────────────────────────────────────────────────────────────────────────
-- FastAPI BackgroundTasks는 응답 직후 같은 워커 프로세스에서 실행됨.
-  · 워커 재시작/크래시 시 진행 중인 분석은 분실 → Analysis 레코드가 queued로 영구 잔존
-  · uvicorn --workers N 사용 시 어느 워커에서 실행됐는지 추적 불가
-  · 동시 분석 요청은 워커 이벤트 루프 안에서 처리됨 → I/O 대기는 OK지만 무제한 누적은 위험
-- 1차 배포 수준에서는 수용 (사용자 ~수십명, 동시 분석 거의 없음).
-- 전환 트리거: 다음 중 하나 발생 시 Celery/RQ + Redis로 마이그레이션 권장
-  · 동시 진행 분석 5건 이상 정기 발생
-  · 워커 재시작 시 잔존 queued 분석 발견 빈번
-  · 멀티 워커/멀티 인스턴스 배포 필요
-- 잔존 queued 정리는 별도 배치(예: 1시간 이상 queued면 failed 처리)로 보완 가능.
+- AI 서버 명세 v4 (2026-05-22 비동기 큐잉 전환):
+  · POST /api/v1/patella/analyses (JSON, 즉시 queued 응답)
+  · GET  /api/v1/patella/jobs/{ai_job_id} (폴링)
+- 호출 흐름:
+  1) 라우터가 POST /analyses 처리 중 submit_analysis() 호출 → ai_job_id 즉시 수신
+  2) 클라이언트 폴링 GET /analyses/{id} 마다 fetch_ai_job_status() 호출 → DB 업데이트
+  3) status terminal 도달 후로는 DB 캐시 응답
 
 응답 매핑 정책 (의료 정보 안전)
 ────────────────────────────────────────────────────────────────────────────
@@ -35,6 +23,7 @@ AI 분석 서버 클라이언트
 환경변수
 ────────────────────────────────────────────────────────────────────────────
 - AI_SERVER_URL                  : AI 서버 base URL (끝 / 없이)
+- AI_INTERNAL_API_KEY            : AI 서버 Bearer 토큰 (Authorization 헤더 값)
 - AI_MOCK_MODE                   : true면 실제 호출 없이 가짜 응답 반환
 - AI_MOCK_SCENARIO               : mock 응답 종류 (completed | rejected | failed)
 - AI_INTERNAL_STAGE_MAPPING      : true면 병원 추천 점수용 _internal_predicted_stage 채움
@@ -44,7 +33,6 @@ AI 분석 서버 클라이언트
 import asyncio
 import os
 import uuid
-from pathlib import Path
 
 import aiohttp
 
@@ -55,6 +43,7 @@ from app.utils.url_helper import build_absolute_url
 # 환경 변수
 # ============================================
 AI_SERVER_URL = os.getenv("AI_SERVER_URL", "").rstrip("/")
+AI_INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY", "")
 AI_MOCK_MODE = os.getenv("AI_MOCK_MODE", "false").lower() == "true"
 AI_MOCK_SCENARIO = os.getenv("AI_MOCK_SCENARIO", "completed").lower()
 AI_INTERNAL_STAGE_MAPPING = os.getenv("AI_INTERNAL_STAGE_MAPPING", "false").lower() == "true"
@@ -62,11 +51,11 @@ AI_INTERNAL_STAGE_MAPPING = os.getenv("AI_INTERNAL_STAGE_MAPPING", "false").lowe
 
 # ============================================
 # 타임아웃
-# - /analyze는 평균 34초, 최대 72초 → 여유 두고 180초
-# - /jobs/{jobId}는 즉시 응답 → 10초
+# - POST /analyses 는 즉시 queued 응답 → 30초
+# - GET /jobs/{ai_job_id} 도 즉시 응답 → 60초 (네트워크 지연 대비 여유)
 # ============================================
-AI_ANALYZE_TIMEOUT_SEC = 180
-AI_POLL_TIMEOUT_SEC = 10
+AI_SUBMIT_TIMEOUT_SEC = 30
+AI_POLL_TIMEOUT_SEC = 60
 
 
 # ============================================
@@ -88,19 +77,18 @@ class AIServerUnavailable(Exception):
 
 
 # ============================================
-# 1. 분석 요청 (동기 호출, 백그라운드 태스크에서 사용)
+# 1. 분석 요청 (즉시 응답, 비동기 큐잉 전환)
 # ============================================
 async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
     """
-    AI 서버에 영상 분석 요청 (동기 호출, 최대 72초+ 소요).
-    Phase 2 (2026-05-22): 페이로드 = multipart/form-data { pet_id, video_id, video_url }.
-    파일은 첨부하지 않음 — AI 서버가 video_url 을 HTTP GET 으로 직접 다운로드.
-
-    multipart 선택 근거: AI Swagger 가 multipart/form-data 명시. 기존 AI 서버도 동일 형식.
-    aiohttp.FormData 사용 시 boundary 자동 생성 + Content-Type 자동 설정.
+    AI 서버에 영상 분석 요청 (POST /api/v1/patella/analyses, application/json).
+    AI 가 즉시 queued 응답을 돌려주고, 실제 분석은 비동기 큐에서 수행함.
 
     Returns:
-        백엔드 응답 포맷 dict — _transform_ai_to_backend() 결과
+        {
+          "ai_job_id": "<job_id 문자열>",
+          "raw": <AI 응답 envelope 전체 dict>,
+        }
 
     Raises:
         AIServerUnavailable: 환경변수 미설정, 타임아웃, 5xx, 4xx, 네트워크 오류
@@ -111,41 +99,100 @@ async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
     if not AI_SERVER_URL:
         raise AIServerUnavailable("AI_SERVER_URL 환경변수가 설정되지 않았습니다")
 
-    url = f"{AI_SERVER_URL}/api/v1/patella/analyze"
+    url = f"{AI_SERVER_URL}/api/v1/patella/analyses"
 
     # URL 정책 반전(2026-05-22): 라우터에서 받은 video_url 은 상대경로일 수 있음.
     # AI 서버는 HTTP GET 다운로드 필요 → 절대 URL 로 변환.
     # build_absolute_url 은 http(s):// 로 시작하면 그대로 통과(이중 prefix 방지) → 기존 DB 절대 URL row 도 안전.
     absolute_video_url = build_absolute_url(video_url)
 
+    body = {
+        "pet_id": pet_id,
+        "video_id": video_id,
+        "video_url": absolute_video_url,
+    }
+
     try:
-        timeout = aiohttp.ClientTimeout(total=AI_ANALYZE_TIMEOUT_SEC)
+        timeout = aiohttp.ClientTimeout(total=AI_SUBMIT_TIMEOUT_SEC)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            form = aiohttp.FormData()
-            form.add_field("pet_id", str(pet_id))
-            form.add_field("video_id", str(video_id))
-            form.add_field("video_url", absolute_video_url)
-            async with session.post(url, data=form) as response:
+            async with session.post(url, json=body, headers=_auth_headers()) as response:
                 if response.status >= 500:
                     body_text = await _safe_text(response)
                     raise AIServerUnavailable(
                         f"AI 서버 오류 {response.status}: {body_text[:200]}"
                     )
                 if response.status >= 400:
-                    # 영상 다운로드 실패/형식 문제 등. detail 추출해서 AIServerUnavailable 로 던짐.
+                    # 영상 URL 형식 문제 등. detail 추출해서 AIServerUnavailable 로 던짐.
                     # 라우터에서 503 ANALYSIS503 으로 응답.
-                    body = await _safe_json(response)
-                    detail = body.get("detail") if isinstance(body, dict) else None
+                    err_body = await _safe_json(response)
+                    detail = err_body.get("detail") if isinstance(err_body, dict) else None
                     raise AIServerUnavailable(
                         f"AI 요청 거절 {response.status}: {detail or '알 수 없는 오류'}"
                     )
                 ai_resp = await response.json()
     except asyncio.TimeoutError:
-        raise AIServerUnavailable(f"AI 호출 타임아웃 ({AI_ANALYZE_TIMEOUT_SEC}초)")
+        raise AIServerUnavailable(f"AI 호출 타임아웃 ({AI_SUBMIT_TIMEOUT_SEC}초)")
     except aiohttp.ClientError as e:
         raise AIServerUnavailable(f"AI 호출 네트워크 오류: {e}")
 
-    return _transform_ai_to_backend(ai_resp)
+    ai_job_id = ai_resp.get("job_id") if isinstance(ai_resp, dict) else None
+    if not ai_job_id:
+        raise AIServerUnavailable("AI 응답에 job_id 가 없습니다")
+
+    return {"ai_job_id": ai_job_id, "raw": ai_resp}
+
+
+# ============================================
+# 1b. 분석 상태/결과 폴링 (GET /jobs/{ai_job_id})
+# ============================================
+async def fetch_ai_job_status(ai_job_id: str) -> dict:
+    """
+    AI 서버에서 ai_job_id 의 현재 상태/결과 envelope 조회.
+    응답은 변환하지 않고 raw 그대로 반환 — 라우터에서 _transform_ai_to_backend() 적용.
+
+    Returns:
+        AI envelope dict (status, prediction, quality, completed_at, error_message ...)
+
+    Raises:
+        AIServerUnavailable: 환경변수 미설정, 타임아웃, 5xx/4xx, 네트워크 오류
+    """
+    if AI_MOCK_MODE:
+        return _mock_fetch_ai_job_status(ai_job_id)
+
+    if not AI_SERVER_URL:
+        raise AIServerUnavailable("AI_SERVER_URL 환경변수가 설정되지 않았습니다")
+
+    url = f"{AI_SERVER_URL}/api/v1/patella/jobs/{ai_job_id}"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=AI_POLL_TIMEOUT_SEC)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=_auth_headers()) as response:
+                if response.status == 404:
+                    raise AIServerUnavailable(f"AI job {ai_job_id} 없음")
+                if response.status >= 500:
+                    body_text = await _safe_text(response)
+                    raise AIServerUnavailable(
+                        f"AI 서버 오류 {response.status}: {body_text[:200]}"
+                    )
+                if response.status >= 400:
+                    err_body = await _safe_json(response)
+                    detail = err_body.get("detail") if isinstance(err_body, dict) else None
+                    raise AIServerUnavailable(
+                        f"AI 폴링 거절 {response.status}: {detail or '알 수 없는 오류'}"
+                    )
+                return await response.json()
+    except asyncio.TimeoutError:
+        raise AIServerUnavailable(f"AI 폴링 타임아웃 ({AI_POLL_TIMEOUT_SEC}초)")
+    except aiohttp.ClientError as e:
+        raise AIServerUnavailable(f"AI 폴링 네트워크 오류: {e}")
+
+
+def _auth_headers() -> dict:
+    """AI 서버 Authorization 헤더. AI_INTERNAL_API_KEY 미설정 시 헤더 생략."""
+    if AI_INTERNAL_API_KEY:
+        return {"Authorization": f"Bearer {AI_INTERNAL_API_KEY}"}
+    return {}
 
 
 # ============================================
@@ -207,51 +254,7 @@ async def fetch_keypoints(job_id: str) -> dict:
 
 
 # ============================================
-# 2. 분석 상태/결과 조회 (사후 재조회용)
-# - 현재 흐름에서는 거의 호출되지 않음.
-#   submit_analysis()가 이미 completed 결과를 반환하므로 DB 캐시로 충분.
-# - AI가 향후 비동기로 바뀌거나, 외부에서 job_id로 재조회할 때 사용.
-# ============================================
-async def poll_analysis(job_id: str) -> dict:
-    """
-    AI 서버에 job 상태 조회 → 백엔드 응답 포맷 dict 반환.
-    """
-    if AI_MOCK_MODE:
-        return _mock_poll(job_id)
-
-    if not AI_SERVER_URL:
-        raise AIServerUnavailable("AI_SERVER_URL 환경변수가 설정되지 않았습니다")
-
-    url = f"{AI_SERVER_URL}/api/v1/patella/jobs/{job_id}"
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=AI_POLL_TIMEOUT_SEC)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    raise AIServerUnavailable(f"AI job {job_id} 없음")
-                if response.status >= 500:
-                    body_text = await _safe_text(response)
-                    raise AIServerUnavailable(
-                        f"AI 서버 오류 {response.status}: {body_text[:200]}"
-                    )
-                if response.status >= 400:
-                    body = await _safe_json(response)
-                    detail = body.get("detail") if isinstance(body, dict) else None
-                    raise AIServerUnavailable(
-                        f"AI 폴링 거절 {response.status}: {detail or '알 수 없는 오류'}"
-                    )
-                ai_resp = await response.json()
-    except asyncio.TimeoutError:
-        raise AIServerUnavailable(f"AI 폴링 타임아웃 ({AI_POLL_TIMEOUT_SEC}초)")
-    except aiohttp.ClientError as e:
-        raise AIServerUnavailable(f"AI 폴링 네트워크 오류: {e}")
-
-    return _transform_ai_to_backend(ai_resp)
-
-
-# ============================================
-# 3. AI 응답 → 백엔드 응답 포맷 변환
+# 2. AI 응답 → 백엔드 응답 포맷 변환
 # - 의료 정보 안전 정책: AI 미제공 필드는 항상 null + TODO
 # ============================================
 def _transform_ai_to_backend(ai_resp: dict) -> dict:
@@ -372,13 +375,29 @@ def _transform_ai_to_backend(ai_resp: dict) -> dict:
 # ============================================
 # Mock 모드 — AI 서버 없이 프론트 연동 테스트
 # - AI_MOCK_SCENARIO 환경변수로 응답 시나리오 전환
+# - submit: 항상 queued 즉시 응답 (실제 AI 비동기 큐잉과 동일)
+# - fetch:  AI_MOCK_SCENARIO 에 따라 completed / rejected / failed envelope 반환
 # ============================================
 def _mock_submit() -> dict:
+    """비동기 큐잉 mock — 즉시 queued envelope 반환."""
     job_id = f"mock_{uuid.uuid4().hex[:12]}"
+    raw = {
+        "job_id": job_id,
+        "status": "queued",
+        "prediction": None,
+        "quality": None,
+        "completed_at": None,
+        "message": "분석 요청이 접수되었습니다. (mock)",
+        "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+    }
+    return {"ai_job_id": job_id, "raw": raw}
 
+
+def _mock_fetch_ai_job_status(ai_job_id: str) -> dict:
+    """폴링 mock — AI_MOCK_SCENARIO 분기로 terminal envelope 반환."""
     if AI_MOCK_SCENARIO == "rejected":
-        ai_resp = {
-            "job_id": job_id,
+        return {
+            "job_id": ai_job_id,
             "status": "rejected",
             "quality": {
                 "status": "rejected",
@@ -395,56 +414,49 @@ def _mock_submit() -> dict:
             "message": "영상 품질 문제로 분석을 진행할 수 없습니다.",
             "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
         }
-    elif AI_MOCK_SCENARIO == "failed":
-        ai_resp = {
-            "job_id": job_id,
+
+    if AI_MOCK_SCENARIO == "failed":
+        return {
+            "job_id": ai_job_id,
             "status": "failed",
             "error_message": "AI 분석 중 오류가 발생했습니다. (mock)",
             "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
         }
-    else:
-        # 기본: completed (clinically_suspicious_possible 시나리오)
-        ai_resp = {
-            "job_id": job_id,
-            "status": "completed",
-            "prediction": {
-                "decision": "clinically_suspicious_possible",
-                "risk_level": "suspicious",
-                "probabilities": {
-                    "prob_target_high_risk": 0.25,
-                    "prob_target_suspicious": 0.45,
-                    "prob_target_abnormal": 0.20,
-                },
-                # P5: AI 응답 확장 필드 (실제 AI가 보낼 형식 가정)
-                "is_uncertain": False,
-                "is_high_risk": False,
-                "user_message": "보행 중 후지 움직임에 비대칭이 관찰되어 슬개골 이상 보행 가능성이 있습니다. 증상이 반복되거나 다리를 들거나 핥는 행동이 보이면 동물병원 검진을 권장합니다.",
-                "display_metrics": {
-                    # 필요 필드 (백엔드가 응답에 노출). AI 명세상 모두 0~100 스케일.
-                    "suspicious_signal_score": 45.0,
-                    "abnormal_signal_score": 20.0,
-                    "analysis_confidence_score": 78.0,
-                    "analysis_confidence_level": "medium",
-                    # 노출 제외 필드 (filter 검증용으로 일부러 포함)
-                    "score_unit": "percent",
-                    "analysis_confidence_source": "probabilities_max",
-                },
-                "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+
+    # 기본: completed (clinically_suspicious_possible 시나리오)
+    return {
+        "job_id": ai_job_id,
+        "status": "completed",
+        "prediction": {
+            "decision": "clinically_suspicious_possible",
+            "risk_level": "suspicious",
+            "probabilities": {
+                "prob_target_high_risk": 0.25,
+                "prob_target_suspicious": 0.45,
+                "prob_target_abnormal": 0.20,
             },
-            "quality": {
-                "status": "passed",
-                "is_acceptable": True,
-                "issues": [],
+            "is_uncertain": False,
+            "is_high_risk": False,
+            "user_message": "보행 중 후지 움직임에 비대칭이 관찰되어 슬개골 이상 보행 가능성이 있습니다. 증상이 반복되거나 다리를 들거나 핥는 행동이 보이면 동물병원 검진을 권장합니다.",
+            "display_metrics": {
+                "suspicious_signal_score": 45.0,
+                "abnormal_signal_score": 20.0,
+                "analysis_confidence_score": 78.0,
+                "analysis_confidence_level": "medium",
+                "score_unit": "percent",
+                "analysis_confidence_source": "probabilities_max",
             },
-            "message": "분석이 완료되었습니다. (mock)",
             "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
-        }
-
-    return _transform_ai_to_backend(ai_resp)
-
-
-def _mock_poll(job_id: str) -> dict:
-    return _mock_submit()
+        },
+        "quality": {
+            "status": "passed",
+            "is_acceptable": True,
+            "issues": [],
+        },
+        "completed_at": "2026-05-22T10:00:00+00:00",
+        "message": "분석이 완료되었습니다. (mock)",
+        "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+    }
 
 
 # ============================================
@@ -549,15 +561,6 @@ def _mock_fetch_keypoints(job_id: str) -> dict:
 # ============================================
 # 내부 헬퍼
 # ============================================
-def _guess_content_type(filename: str) -> str:
-    ext = Path(filename).suffix.lower()
-    return {
-        ".mp4": "video/mp4",
-        ".mov": "video/quicktime",
-        ".avi": "video/x-msvideo",
-    }.get(ext, "application/octet-stream")
-
-
 def _max_probability(probs):
     """AI probabilities dict → 최대값 (confidence). dict 아니거나 비어있으면 None."""
     if not isinstance(probs, dict) or not probs:

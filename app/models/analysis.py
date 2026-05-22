@@ -5,6 +5,9 @@ Analysis 모델 (영상 분석 테이블)
   · job_id 컬럼 추가 (AI 서버 job 추적)
   · completed_at 컬럼 추가 (분석 종료 시각)
   · memo 컬럼 제거 (1차 배포 대상 아님)
+- 2026-05-22 변경: AI 서버 비동기 큐잉 전환
+  · ai_job_id 컬럼 추가 (POST /api/v1/patella/analyses 응답 직후 저장,
+    이후 GET /api/v1/patella/jobs/{ai_job_id} 폴링 키)
 """
 
 from sqlalchemy import Column, BigInteger, String, DateTime, ForeignKey, JSON
@@ -23,6 +26,12 @@ class Analysis(Base):
     # 새 INSERT 는 항상 채워짐. 기존 row(id <= phase2 적용 직전 max)는 NULL.
     video_id = Column(BigInteger, ForeignKey("videos.video_id", ondelete="SET NULL"), nullable=True)
     job_id = Column(String(100), nullable=True, comment="AI 서버에서 발급한 job ID")
+    ai_job_id = Column(
+        String(64),
+        nullable=True,
+        index=True,
+        comment="AI 비동기 폴링용 job ID (POST /analyses 응답에서 즉시 수신)",
+    )
     status = Column(
         String(20),
         nullable=False,

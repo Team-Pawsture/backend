@@ -1,37 +1,24 @@
 """
 영상 분석 관련 API 라우터
-- POST /analyses : 영상 분석 요청 (multipart/form-data)
+- POST /analyses : 영상 분석 요청 (JSON {pet_id, video_id})
 - GET /analyses/{analysis_id} : 분석 결과 조회 (폴링)
 
 2026-05-17 v2: 명세서 v2 기준 신규 구현
-2026-05-17 v3: BackgroundTasks 비동기 흐름 적용
-- AI /analyze가 평균 34초/최대 72초 동기 호출이라 요청 처리 중 응답 보류 불가
+2026-05-22 v4: AI 서버 비동기 큐잉 전환
+- AI POST /api/v1/patella/analyses 가 즉시 queued 응답 → job_id 발급.
 - 흐름:
-  1) POST /analyses → 영상 저장 → Analysis(status=queued) 즉시 생성 → BackgroundTask 등록
-  2) 라우터는 곧바로 queued 응답 반환 (프론트는 명세대로 2~3초 간격 폴링)
-  3) 백그라운드 함수가 새 SessionLocal로 submit_analysis() 호출 → DB 업데이트
-  4) GET /analyses/{id}는 DB 캐시만 읽음 (AI 서버 폴링 안 함)
-
-────────────────────────────────────────────────────────────────────────────
-⚠ BackgroundTasks 한계 (app/utils/ai_client.py docstring과 함께 참고)
-────────────────────────────────────────────────────────────────────────────
-- FastAPI BackgroundTasks는 응답 직후 같은 워커 프로세스에서 실행됨.
-  · 워커 재시작/크래시 시 진행 중인 분석은 영구 queued로 잔존
-  · uvicorn --workers N 사용 시 어느 워커에서 실행됐는지 추적 불가
-  · 동시 분석은 워커 이벤트 루프 안에서 처리 (I/O 대기는 OK, 무제한 누적은 위험)
-- 1차 배포 수준 수용. 전환 트리거:
-  · 동시 진행 분석 5건 이상 정기 발생
-  · 워커 재시작 시 잔존 queued 빈번
-  · 멀티 워커/멀티 인스턴스 배포 필요
-  → Celery/RQ + Redis로 마이그레이션
-- 임시 보완: 1시간 이상 queued인 Analysis는 별도 배치로 failed 변환 권장.
+  1) POST /analyses → Analysis(status=queued, ai_job_id=None) 생성 + commit (analysis_id 확정)
+  2) submit_analysis() 동기 호출 → ai_job_id 수신 (수초 내) → Analysis.ai_job_id 업데이트
+  3) AI 호출 실패 시 status=failed 로 기록 후 503 반환
+  4) GET /analyses/{id} 마다 status terminal 아니면 fetch_ai_job_status() 로 폴링
+     · completed/rejected/failed → DB 영구 캐시
+     · 폴링 실패(timeout 등) → 현재 DB 상태 그대로 응답 (클라가 재시도)
 """
 
 from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Body,
     Depends,
     HTTPException,
@@ -41,7 +28,7 @@ from fastapi import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import SessionLocal, get_db
+from app.database import get_db
 from app.models.user import User
 from app.models.pet import Pet
 from app.models.analysis import Analysis
@@ -49,9 +36,17 @@ from app.models.video import Video
 from app.schemas.user import CommonResponse
 from app.schemas.video import AnalysisCreateRequest
 from app.utils.security import get_current_user
-from app.utils.ai_client import submit_analysis, fetch_keypoints, AIServerUnavailable
+from app.utils.ai_client import (
+    AIServerUnavailable,
+    _transform_ai_to_backend,
+    fetch_ai_job_status,
+    fetch_keypoints,
+    submit_analysis,
+)
 from app.utils.datetime_helper import to_kst_iso
 # 2026-05-22 URL 정책 반전: 응답은 상대경로. AI 호출 시 절대 URL 변환은 ai_client 내부 처리.
+
+TERMINAL_STATUSES = ("completed", "rejected", "failed")
 
 
 router = APIRouter(prefix="/analyses", tags=["영상 분석"])
@@ -86,25 +81,23 @@ def _pet_or_raise(db: Session, pet_id: int, user_id: int) -> Pet:
 
 
 # ============================================
-# POST /analyses — 영상 분석 요청 (Phase 2: JSON 입력)
+# POST /analyses — 영상 분석 요청 (JSON 입력, 비동기 큐잉)
 # - 영상 업로드는 사전에 POST /videos 로 분리됨
-# - 본 라우터는 video_id 참조만 받음
+# - AI 서버는 즉시 queued 응답 → 백엔드는 ai_job_id 만 받아 저장
 # ============================================
 @router.post("", response_model=CommonResponse, status_code=status.HTTP_200_OK)
 async def create_analysis(
-    background_tasks: BackgroundTasks,
     payload: AnalysisCreateRequest = Body(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    분석 요청 생성 (Phase 2, 2026-05-22)
+    분석 요청 생성 (2026-05-22 v4, 비동기 큐잉)
     - 입력: JSON {pet_id, video_id}
     - 권한 체크: 본인 반려견만 가능 (PET404/PET403)
     - video_id 검증: 존재 + 소유자 일치 + pet_id 일치
     - 중복 방지: 동일 pet_id 에 queued/running 상태 있으면 ANALYSIS409
-    - Analysis(status=queued) 즉시 생성 → 응답 반환
-    - AI 호출은 BackgroundTask 에서 비동기 처리
+    - Analysis(status=queued, ai_job_id=None) 즉시 생성 → AI 큐잉 호출 → ai_job_id 저장
     - 영상 파일은 videos 테이블 소유. 분석 종료 후에도 삭제 X (영구 보존).
     """
     pet = _pet_or_raise(db, payload.pet_id, current_user.user_id)
@@ -159,14 +152,13 @@ async def create_analysis(
             },
         )
 
-    # 3. Analysis 레코드 즉시 생성 (status=queued)
-    #    video_url 컬럼은 NOT NULL 유지(backward compat) → videos.file_url 복사값으로 채움.
-    #    동시 요청 race 차단은 DB partial unique index(uq_analyses_pet_in_progress)에 위임.
+    # 3. Analysis 레코드 즉시 생성 (status=queued, ai_job_id 미정)
     new_analysis = Analysis(
         pet_id=pet.pet_id,
         video_id=video.video_id,
         video_url=video.file_url,
         job_id=None,
+        ai_job_id=None,
         status="queued",
     )
     db.add(new_analysis)
@@ -174,7 +166,6 @@ async def create_analysis(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # videos 테이블 영상은 절대 정리하지 않음 (재시도 가능, 영구 보존)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -186,15 +177,39 @@ async def create_analysis(
         )
     db.refresh(new_analysis)
 
-    # 4. 백그라운드 태스크 등록 — 응답 직후 실행됨.
-    #    AI 서버는 video_url 을 HTTP GET 으로 다운로드. 백엔드는 파일 경로 전달 X.
-    background_tasks.add_task(
-        _run_analysis_in_background,
-        analysis_id=new_analysis.analysis_id,
-        pet_id=pet.pet_id,
-        video_id=video.video_id,
-        video_url=video.file_url,
-    )
+    # 4. AI 서버에 분석 요청 (즉시 ai_job_id 수신, 본 분석은 AI 큐에서 비동기 수행)
+    try:
+        submit_result = await submit_analysis(
+            pet_id=pet.pet_id,
+            video_id=video.video_id,
+            video_url=video.file_url,
+        )
+    except AIServerUnavailable as e:
+        new_analysis.status = "failed"
+        new_analysis.ai_result = {
+            "prediction": None,
+            "recommendation": None,
+            "quality": None,
+            "progress": None,
+            "error_message": f"AI 서버 호출 실패: {e}",
+        }
+        new_analysis.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "isSuccess": False,
+                "code": "ANALYSIS503",
+                "message": f"AI 서버를 사용할 수 없습니다. ({e})",
+                "result": None,
+            },
+        )
+
+    # 5. ai_job_id + raw envelope 저장
+    new_analysis.ai_job_id = submit_result["ai_job_id"]
+    new_analysis.ai_result = submit_result.get("raw")
+    db.commit()
+    db.refresh(new_analysis)
 
     return CommonResponse(
         isSuccess=True,
@@ -360,8 +375,12 @@ async def get_analysis(
     """
     분석 결과 조회 (프론트가 2~3초 간격으로 폴링)
     - 권한 체크: 본인 반려견의 분석만 조회 가능 (ANALYSIS403)
-    - DB 캐시만 읽음. AI 서버 폴링은 BackgroundTask가 담당하므로 여기선 불필요.
-    - 응답 필드 구성은 status에 따라 분기 (_build_analysis_response 참조)
+    - 흐름:
+      1) 분석 + 권한 검증
+      2) status 가 terminal(completed/rejected/failed) 이면 DB 캐시로 즉시 응답
+      3) terminal 아니고 ai_job_id 있으면 fetch_ai_job_status() 호출
+         · 성공 시 DB 업데이트 후 응답
+         · 실패(timeout 등) 시 현재 DB 상태 그대로 응답 (클라가 재시도)
     """
     analysis = db.query(Analysis).filter(Analysis.analysis_id == analysis_id).first()
 
@@ -388,6 +407,15 @@ async def get_analysis(
             },
         )
 
+    # terminal 아니고 ai_job_id 있으면 AI 폴링 시도
+    if analysis.status not in TERMINAL_STATUSES and analysis.ai_job_id:
+        try:
+            raw_envelope = await fetch_ai_job_status(analysis.ai_job_id)
+            _apply_ai_envelope(db, analysis, raw_envelope)
+        except AIServerUnavailable:
+            # 폴링 실패 — 현재 DB 상태 그대로 반환 (클라가 다음 주기에 재시도)
+            pass
+
     return CommonResponse(
         isSuccess=True,
         code="COMMON200",
@@ -397,103 +425,50 @@ async def get_analysis(
 
 
 # ============================================
-# 백그라운드 러너: AI 서버 호출 → DB 업데이트
-# - Phase 2 (2026-05-22): 입력이 video_url 로 변경. 영상 파일은 videos 가 영구 소유 → 정리 안 함.
-# - 새 SessionLocal() 사용 (라우터 의존성 세션은 응답 후 닫힘)
-# - try/finally 로 세션 close
-# - AIServerUnavailable + 일반 Exception 모두 잡아 failed 로 기록 (분실 방지)
+# 내부 헬퍼: AI envelope(raw) → Analysis 레코드 반영
+# - fetch_ai_job_status() 의 raw 응답을 그대로 받음 (변환 X)
+# - 변환은 이 안에서 _transform_ai_to_backend() 로 수행
+# - _internal_predicted_stage 가 있으면 ai_result 에 보존 (hospitals.py 추천 점수용)
 # ============================================
-async def _run_analysis_in_background(
-    analysis_id: int,
-    pet_id: int,
-    video_id: int,
-    video_url: str,
-) -> None:
-    db = SessionLocal()
-    try:
-        analysis = db.query(Analysis).filter(Analysis.analysis_id == analysis_id).first()
-        if not analysis:
-            # 이론상 발생 X (방금 생성한 레코드). 안전망.
-            return
+def _apply_ai_envelope(db: Session, analysis: Analysis, envelope: dict) -> None:
+    transformed = _transform_ai_to_backend(envelope) if isinstance(envelope, dict) else {}
 
-        try:
-            ai_result = await submit_analysis(
-                pet_id=pet_id, video_id=video_id, video_url=video_url
-            )
-        except AIServerUnavailable as e:
-            # 환경변수 미설정/네트워크/5xx/4xx — DB에 실패 기록
-            analysis.status = "failed"
-            analysis.ai_result = {
-                "prediction": None,
-                "recommendation": None,
-                "quality": None,
-                "progress": None,
-                "error_message": f"AI 서버 호출 실패: {e}",
-            }
-            analysis.completed_at = datetime.now(timezone.utc)
-            db.commit()
-            return
-        except Exception as e:
-            # 예상치 못한 예외도 분실 없이 failed로 기록 (분석 영구 queued 방지)
-            analysis.status = "failed"
-            analysis.ai_result = {
-                "prediction": None,
-                "recommendation": None,
-                "quality": None,
-                "progress": None,
-                "error_message": f"AI 처리 중 예외: {type(e).__name__}: {e}",
-            }
-            analysis.completed_at = datetime.now(timezone.utc)
-            db.commit()
-            return
-
-        # 정상 결과 반영 (기존 _apply_poll_result 재사용)
-        _apply_poll_result(db, analysis, ai_result)
-    finally:
-        db.close()
-        # Phase 2: 영상 파일은 videos 테이블이 영구 소유 → 분석 종료 후에도 삭제 안 함.
-        # 분석 실패해도 video row/파일 유지 (재분석 가능). 정리는 별도 배치 (백로그).
-
-
-# ============================================
-# 내부 헬퍼: AI 결과(또는 폴링 결과)를 Analysis 레코드에 반영
-# - ai_client._transform_ai_to_backend() 의 출력 구조를 그대로 받음
-# - _internal_predicted_stage 가 있으면 ai_result 안에 그대로 보존
-#   (병원 추천 점수 계산 시 hospitals.py 에서 참조)
-# ============================================
-def _apply_poll_result(db: Session, analysis: Analysis, poll: dict) -> None:
-    new_status = poll.get("status")
-    if new_status in ("queued", "running", "completed", "rejected", "failed"):
+    new_status = transformed.get("status")
+    if new_status in ("queued", "uploaded", "running"):
+        # AI side intermediate state. queued 는 유지, uploaded/running 은 running 으로 정규화.
+        if new_status in ("uploaded", "running"):
+            analysis.status = "running"
+        # queued 그대로
+    elif new_status in ("completed", "rejected", "failed"):
         analysis.status = new_status
 
-    # job_id가 새로 들어왔으면 저장
-    job_id = poll.get("job_id")
-    if job_id and not analysis.job_id:
-        analysis.job_id = job_id
+    # 폴링 envelope 에도 job_id 가 들어옴 → 빈 경우 채움
+    raw_job_id = transformed.get("job_id") or envelope.get("job_id")
+    if raw_job_id and not analysis.job_id:
+        analysis.job_id = raw_job_id
 
-    # ai_result에 전체 저장 (prediction / recommendation / quality / progress / error_message / gait_observation_summary)
-    # _internal_predicted_stage(있으면)는 응답에 노출되지 않지만 hospitals.py에서 참조하기 위해 보존.
-    # Phase 1: gait_observation_summary 도 raw 저장 → 응답 빌더가 최상위로 노출.
+    # ai_result 에 변환 결과 저장 (completed/rejected/failed 만 raw 유의미)
+    # running/queued 폴링도 progress 등 부분 업데이트 가능하도록 저장
     ai_result_payload = {
-        "prediction": poll.get("prediction"),
-        "recommendation": poll.get("recommendation"),
-        "quality": poll.get("quality"),
-        "progress": poll.get("progress"),
-        "error_message": poll.get("error_message"),
-        "gait_observation_summary": poll.get("gait_observation_summary"),
+        "prediction": transformed.get("prediction"),
+        "recommendation": transformed.get("recommendation"),
+        "quality": transformed.get("quality"),
+        "progress": transformed.get("progress"),
+        "error_message": transformed.get("error_message"),
+        "gait_observation_summary": transformed.get("gait_observation_summary"),
     }
-    if "_internal_predicted_stage" in poll:
-        ai_result_payload["_internal_predicted_stage"] = poll["_internal_predicted_stage"]
+    if "_internal_predicted_stage" in transformed:
+        ai_result_payload["_internal_predicted_stage"] = transformed["_internal_predicted_stage"]
     analysis.ai_result = ai_result_payload
 
     # risk_level 별도 컬럼에도 저장 (pets 상세 조회 시 join 비용 감소)
-    risk = poll.get("risk_level")
-    if not risk and isinstance(poll.get("prediction"), dict):
-        risk = poll["prediction"].get("risk_level")
+    risk = transformed.get("risk_level")
+    if not risk and isinstance(transformed.get("prediction"), dict):
+        risk = transformed["prediction"].get("risk_level")
     if risk:
         analysis.risk_level = risk
 
-    if analysis.status in ("completed", "rejected", "failed") and analysis.completed_at is None:
+    if analysis.status in TERMINAL_STATUSES and analysis.completed_at is None:
         analysis.completed_at = datetime.now(timezone.utc)
 
     db.commit()
