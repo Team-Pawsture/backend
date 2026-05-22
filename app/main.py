@@ -11,11 +11,20 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from fastapi.staticfiles import StaticFiles
 
 # favorites, notifications, push: 1차 배포 제외, 추후 활성화 예정 (2026-05-13)
 # import는 유지해서 다른 코드에서 참조 가능하도록 함 (라우터 노출만 끊음)
-from app.routers import auth, pets, analyses, favorites, notifications, push, hospitals, videos  # noqa: F401
+from app.routers import (  # noqa: F401
+    analyses,
+    auth,
+    favorites,
+    hospitals,
+    legacy_uploads,
+    notifications,
+    pets,
+    push,
+    videos,
+)
 
 app = FastAPI(
     title="성신에이전시 백엔드 API",
@@ -111,15 +120,9 @@ app.include_router(analyses.router)
 app.include_router(hospitals.router)
 app.include_router(videos.router)  # Phase 2 (2026-05-22): 영상 업로드 분리
 
-# 정적 파일 서빙 (업로드된 이미지/영상 접근용)
-# /uploads/pet_profiles/xxx.jpg, /uploads/videos/xxx.mp4 로 접근 가능
-# uploads/ 는 .gitignore 대상이라 신규 환경(Render 등)에는 존재하지 않음 → mount 전에 자동 생성.
-# uploads/analysis_videos 는 Phase 1 이전 영상 보존용으로 유지 (새 경로엔 안 씀).
-os.makedirs("uploads", exist_ok=True)
-os.makedirs("uploads/pet_profiles", exist_ok=True)
-os.makedirs("uploads/analysis_videos", exist_ok=True)
-os.makedirs("uploads/videos", exist_ok=True)  # Phase 2 신규
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# /uploads/* legacy 호환: R2 마이그레이션(2026-05-22 단계 D)으로 StaticFiles mount 제거.
+# 기존 URL 형식("/uploads/...")으로 들어오는 GET 요청을 R2 public URL 로 302 redirect.
+app.include_router(legacy_uploads.router)
 
 
 @app.get("/")
