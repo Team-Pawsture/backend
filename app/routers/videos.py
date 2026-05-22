@@ -1,6 +1,6 @@
 """
-영상 업로드 API — Phase 2 (2026-05-22)
-- POST /videos: multipart 업로드 → videos 테이블에 영구 저장
+영상 업로드 API — Phase 2 (2026-05-22) / R2 전환 (2026-05-22 단계 B)
+- POST /videos: multipart 업로드 → Cloudflare R2 에 객체 저장 + videos 테이블 row 생성
 - 응답으로 video_id, video_url, uploaded_at 반환
 - 이후 POST /analyses 가 video_id 로 참조
 
@@ -8,6 +8,13 @@
 - 영상은 분석 후에도 영구 보존 (재분석 가능)
 - 파일 정리 배치는 별도 백로그
 - AI 서버는 video_url 을 HTTP GET 으로 다운로드
+
+R2 매핑 (옵션 W, 변경 불가 원칙)
+- R2 객체 키           : videos/{uuid}{ext}
+- DB videos.file_path  : R2 객체 키 (예: videos/{uuid}.mp4) — 의미 재정의
+- DB videos.file_url   : 기존 형식 "/uploads/videos/{uuid}{ext}" 유지 (프론트 호환)
+- 응답 video_url       : 위 file_url 그대로 (스키마 변경 X)
+- AI 호출 시 절대 URL  : url_helper.build_absolute_url 이 R2 public URL 로 변환
 """
 
 import uuid
@@ -21,18 +28,19 @@ from app.models.pet import Pet
 from app.models.user import User
 from app.models.video import Video
 from app.schemas.user import CommonResponse
+from app.utils import r2_client
 from app.utils.datetime_helper import to_kst_iso
 from app.utils.security import get_current_user
-# 2026-05-22 URL 정책 반전: DB / 응답 모두 상대경로 저장. AI 호출 시 절대 URL 변환은 ai_client 내부.
 
 
 router = APIRouter(prefix="/videos", tags=["영상 업로드"])
 
 
 # ============================================
-# 설정값 (Phase 2 신설 — 기존 video_handler 와 분리해 위치 명확화)
+# 설정값
+# - 디스크 경로 상수는 R2 전환으로 제거. R2 키 prefix 는 핸들러 내부 상수 R2_KEY_PREFIX.
 # ============================================
-VIDEO_UPLOAD_DIR = Path("uploads/videos")
+R2_KEY_PREFIX = "videos/"
 MAX_VIDEO_SIZE = 100 * 1024 * 1024  # 100MB
 # AI 서버 명세 + 기존 video_handler 와 일치
 ALLOWED_MIME_TYPES = {
@@ -151,18 +159,11 @@ async def upload_video(
             },
         )
 
-    # 4. 안전 파일명 + 저장
-    VIDEO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # 4. 안전 파일명 + R2 객체 키
     safe_filename = f"{uuid.uuid4().hex}{ext}"
-    file_path = VIDEO_UPLOAD_DIR / safe_filename
-    with open(file_path, "wb") as f:
-        f.write(contents)
+    r2_key = f"{R2_KEY_PREFIX}{safe_filename}"
 
-    # 응답 + DB 모두 상대경로 (URL 정책 반전). 프론트가 도메인 prefix 부착.
-    # AI 서버 호출 시점에만 ai_client 가 BASE_URL 붙여 절대 URL 로 변환.
-    relative_url = f"/uploads/videos/{safe_filename}"
-
-    # 5. DB row 생성
+    # 5. MIME 확정 (R2 메타 + DB 양쪽에 동일 값 사용)
     # client 가 잘못된 content_type 보내거나(application/octet-stream 등) 비어있으면
     # 확장자로 추정한 표준 MIME 사용 (ALLOWED_MIME_TYPES 에 있는 값만 저장).
     ext_to_mime = {v: k for k, v in ALLOWED_MIME_TYPES.items()}
@@ -170,10 +171,36 @@ async def upload_video(
         resolved_mime = video.content_type
     else:
         resolved_mime = ext_to_mime.get(ext, "video/mp4")
+
+    # 6. R2 업로드 (성공 시에만 DB row 생성 — 트랜잭션 안전)
+    # 이미 size 검증을 위해 contents 를 메모리에 다 올린 상태라 bytes 그대로 전달.
+    # 더 큰 파일을 다루게 되면 stream 업로드(_upload_fileobj)로 전환 검토.
+    try:
+        await r2_client.upload_file(
+            file_obj=contents,
+            key=r2_key,
+            content_type=resolved_mime,
+        )
+    except r2_client.R2UploadError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "isSuccess": False,
+                "code": "STORAGE503",
+                "message": f"영상 업로드에 실패했습니다. ({e})",
+                "result": None,
+            },
+        )
+
+    # 7. DB row 생성
+    # - file_path : R2 객체 키 (의미 재정의, 단계 B)
+    # - file_url  : 기존 형식 "/uploads/videos/{filename}" 유지 (프론트 호환).
+    #               AI 호출 시점에 url_helper.build_absolute_url 이 R2 public URL 로 치환.
+    relative_url = f"/uploads/videos/{safe_filename}"
     new_video = Video(
         pet_id=pet.pet_id,
         user_id=current_user.user_id,
-        file_path=str(file_path),
+        file_path=r2_key,
         file_url=relative_url,
         file_size=file_size,
         mime_type=resolved_mime,
