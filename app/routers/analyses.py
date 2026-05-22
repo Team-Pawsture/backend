@@ -32,12 +32,10 @@ from datetime import datetime, timezone
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Body,
     Depends,
-    File,
-    Form,
     HTTPException,
     Query,
-    UploadFile,
     status,
 )
 from sqlalchemy.exc import IntegrityError
@@ -47,16 +45,13 @@ from app.database import SessionLocal, get_db
 from app.models.user import User
 from app.models.pet import Pet
 from app.models.analysis import Analysis
+from app.models.video import Video
 from app.schemas.user import CommonResponse
+from app.schemas.video import AnalysisCreateRequest
 from app.utils.security import get_current_user
-from app.utils.video_handler import (
-    is_allowed_video_extension,
-    save_analysis_video,
-    delete_analysis_video,
-)
 from app.utils.ai_client import submit_analysis, fetch_keypoints, AIServerUnavailable
 from app.utils.datetime_helper import to_kst_iso
-from app.utils.url_helper import build_absolute_url
+# 2026-05-22 URL 정책 반전: 응답은 상대경로. AI 호출 시 절대 URL 변환은 ai_client 내부 처리.
 
 
 router = APIRouter(prefix="/analyses", tags=["영상 분석"])
@@ -91,27 +86,63 @@ def _pet_or_raise(db: Session, pet_id: int, user_id: int) -> Pet:
 
 
 # ============================================
-# POST /analyses — 영상 분석 요청 (multipart/form-data)
+# POST /analyses — 영상 분석 요청 (Phase 2: JSON 입력)
+# - 영상 업로드는 사전에 POST /videos 로 분리됨
+# - 본 라우터는 video_id 참조만 받음
 # ============================================
 @router.post("", response_model=CommonResponse, status_code=status.HTTP_200_OK)
 async def create_analysis(
     background_tasks: BackgroundTasks,
-    pet_id: int = Form(..., description="분석 대상 반려견 ID"),
-    video: UploadFile = File(..., description="영상 파일 (mp4/mov/avi, 100MB 이하)"),
+    payload: AnalysisCreateRequest = Body(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    분석 요청 생성
+    분석 요청 생성 (Phase 2, 2026-05-22)
+    - 입력: JSON {pet_id, video_id}
     - 권한 체크: 본인 반려견만 가능 (PET404/PET403)
-    - 중복 방지: 동일 pet_id에 queued/running 상태 있으면 ANALYSIS409
-    - 파일 검증: 확장자(mp4/mov/avi), 크기(100MB) — 검증 실패 시 COMMON400
-    - 영상 저장 후 Analysis(status=queued) 생성 → 즉시 응답
-    - AI 호출은 BackgroundTask에서 비동기 처리 (라우터 응답 후 실행)
+    - video_id 검증: 존재 + 소유자 일치 + pet_id 일치
+    - 중복 방지: 동일 pet_id 에 queued/running 상태 있으면 ANALYSIS409
+    - Analysis(status=queued) 즉시 생성 → 응답 반환
+    - AI 호출은 BackgroundTask 에서 비동기 처리
+    - 영상 파일은 videos 테이블 소유. 분석 종료 후에도 삭제 X (영구 보존).
     """
-    pet = _pet_or_raise(db, pet_id, current_user.user_id)
+    pet = _pet_or_raise(db, payload.pet_id, current_user.user_id)
 
-    # 1. 중복 요청 차단 (queued/running)
+    # 1. video_id 검증
+    video = db.query(Video).filter(Video.video_id == payload.video_id).first()
+    if not video:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "isSuccess": False,
+                "code": "VIDEO404",
+                "message": "해당 영상을 찾을 수 없습니다.",
+                "result": None,
+            },
+        )
+    if video.user_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "isSuccess": False,
+                "code": "VIDEO403",
+                "message": "해당 영상에 접근 권한이 없습니다.",
+                "result": None,
+            },
+        )
+    if video.pet_id != pet.pet_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "isSuccess": False,
+                "code": "COMMON400",
+                "message": "유효성 검사 실패",
+                "result": {"video_id": "video_id 가 pet_id 와 일치하지 않습니다"},
+            },
+        )
+
+    # 2. 중복 요청 차단 (queued/running)
     in_progress = (
         db.query(Analysis)
         .filter(Analysis.pet_id == pet.pet_id, Analysis.status.in_(["queued", "running"]))
@@ -128,59 +159,13 @@ async def create_analysis(
             },
         )
 
-    # 2. 파일 첨부 + 확장자 검증
-    if not video.filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "isSuccess": False,
-                "code": "COMMON400",
-                "message": "유효성 검사 실패",
-                "result": {"video": "video 파일은 필수입니다"},
-            },
-        )
-
-    if not is_allowed_video_extension(video.filename):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "isSuccess": False,
-                "code": "COMMON400",
-                "message": "지원하지 않는 파일 형식입니다. (mp4, mov, avi 만 가능)",
-                "result": None,
-            },
-        )
-
-    # 3. 영상 저장 (크기 검증 포함)
-    try:
-        saved = await save_analysis_video(pet.pet_id, video)
-    except ValueError as e:
-        msg = "파일 크기는 100MB 이하여야 합니다." if "100MB" in str(e) else str(e)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "isSuccess": False,
-                "code": "COMMON400",
-                "message": msg,
-                "result": None,
-            },
-        )
-
-    # 4. Analysis 레코드 즉시 생성 (status=queued, job_id 없음)
+    # 3. Analysis 레코드 즉시 생성 (status=queued)
+    #    video_url 컬럼은 NOT NULL 유지(backward compat) → videos.file_url 복사값으로 채움.
     #    동시 요청 race 차단은 DB partial unique index(uq_analyses_pet_in_progress)에 위임.
-    #    SELECT 기반 in_progress 체크(위 1번)는 일반 케이스 빠른 응답용이고,
-    #    SELECT-INSERT 사이 동시 요청은 IntegrityError로 잡힘.
-    #
-    #    [Known limitation - mock 환경 테스트의 한계]
-    #    Mock 모드(_mock_submit)는 100ms 이내 완료되므로 병렬 POST 두 건이
-    #    각자 라우터에 도착하는 시점에 첫 BG가 이미 끝나 있을 가능성이 높음
-    #    → partial index가 발동할 race window를 안정적으로 재현하기 어려움.
-    #    실제 AI 서버(34초+)에선 첫 분석이 진행 중인 동안 두 번째 요청이 들어와
-    #    SELECT 1차 체크 또는 INSERT의 partial index에서 차단됨.
-    #    (DB 레벨 차단 효과는 psql로 동일 pet에 queued 행 2건 INSERT 시도로 확인 완료)
     new_analysis = Analysis(
         pet_id=pet.pet_id,
-        video_url=saved["url_path"],
+        video_id=video.video_id,
+        video_url=video.file_url,
         job_id=None,
         status="queued",
     )
@@ -189,9 +174,7 @@ async def create_analysis(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # partial unique index 충돌 = 동일 pet 진행 중 분석 존재 = 명세서 409 ANALYSIS409
-        # 업로드된 영상은 사용 안 되므로 정리.
-        delete_analysis_video(saved["file_path"])
+        # videos 테이블 영상은 절대 정리하지 않음 (재시도 가능, 영구 보존)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -203,13 +186,14 @@ async def create_analysis(
         )
     db.refresh(new_analysis)
 
-    # 5. 백그라운드 태스크 등록 — 응답 직후 실행됨
-    #   주의: 라우터 의존성으로 받은 db 세션은 응답 후 닫히므로 백그라운드에서 사용 불가.
-    #         _run_analysis_in_background()가 새 SessionLocal()을 직접 연다.
+    # 4. 백그라운드 태스크 등록 — 응답 직후 실행됨.
+    #    AI 서버는 video_url 을 HTTP GET 으로 다운로드. 백엔드는 파일 경로 전달 X.
     background_tasks.add_task(
         _run_analysis_in_background,
         analysis_id=new_analysis.analysis_id,
-        video_file_path=saved["file_path"],
+        pet_id=pet.pet_id,
+        video_id=video.video_id,
+        video_url=video.file_url,
     )
 
     return CommonResponse(
@@ -261,7 +245,7 @@ def get_recent_analyses(
             "analysis_id": analysis.analysis_id,
             "pet_id": analysis.pet_id,
             "pet_name": pet.name,
-            "pet_profile_image_url": build_absolute_url(pet.profile_image_url),
+            "pet_profile_image_url": pet.profile_image_url,
             "status": analysis.status,
             "risk_level": analysis.risk_level,
             "created_at": to_kst_iso(analysis.created_at),
@@ -413,15 +397,17 @@ async def get_analysis(
 
 
 # ============================================
-# 백그라운드 러너: AI 서버 호출 → DB 업데이트 → 영상 정리
+# 백그라운드 러너: AI 서버 호출 → DB 업데이트
+# - Phase 2 (2026-05-22): 입력이 video_url 로 변경. 영상 파일은 videos 가 영구 소유 → 정리 안 함.
 # - 새 SessionLocal() 사용 (라우터 의존성 세션은 응답 후 닫힘)
-# - try/finally로 세션과 영상 파일 모두 정리
-# - AIServerUnavailable + 일반 Exception 모두 잡아 failed로 기록 (분실 방지)
-# - 영상 파일은 분석 종료 시점에 삭제 — AI 서버가 자체 사본 보유, 프론트는 재폴링 안 함
+# - try/finally 로 세션 close
+# - AIServerUnavailable + 일반 Exception 모두 잡아 failed 로 기록 (분실 방지)
 # ============================================
 async def _run_analysis_in_background(
     analysis_id: int,
-    video_file_path: str,
+    pet_id: int,
+    video_id: int,
+    video_url: str,
 ) -> None:
     db = SessionLocal()
     try:
@@ -431,7 +417,9 @@ async def _run_analysis_in_background(
             return
 
         try:
-            ai_result = await submit_analysis(video_file_path)
+            ai_result = await submit_analysis(
+                pet_id=pet_id, video_id=video_id, video_url=video_url
+            )
         except AIServerUnavailable as e:
             # 환경변수 미설정/네트워크/5xx/4xx — DB에 실패 기록
             analysis.status = "failed"
@@ -463,9 +451,8 @@ async def _run_analysis_in_background(
         _apply_poll_result(db, analysis, ai_result)
     finally:
         db.close()
-        # 영상 파일 정리: AI 서버가 자체 사본 보유. 백엔드 측 재폴링/재시도 없음.
-        # 분석 종료 시점(성공/실패/거절) 모두 삭제. 디스크 누적 방지.
-        delete_analysis_video(video_file_path)
+        # Phase 2: 영상 파일은 videos 테이블이 영구 소유 → 분석 종료 후에도 삭제 안 함.
+        # 분석 실패해도 video row/파일 유지 (재분석 가능). 정리는 별도 배치 (백로그).
 
 
 # ============================================
@@ -484,14 +471,16 @@ def _apply_poll_result(db: Session, analysis: Analysis, poll: dict) -> None:
     if job_id and not analysis.job_id:
         analysis.job_id = job_id
 
-    # ai_result에 전체 저장 (prediction / recommendation / quality / progress / error_message)
+    # ai_result에 전체 저장 (prediction / recommendation / quality / progress / error_message / gait_observation_summary)
     # _internal_predicted_stage(있으면)는 응답에 노출되지 않지만 hospitals.py에서 참조하기 위해 보존.
+    # Phase 1: gait_observation_summary 도 raw 저장 → 응답 빌더가 최상위로 노출.
     ai_result_payload = {
         "prediction": poll.get("prediction"),
         "recommendation": poll.get("recommendation"),
         "quality": poll.get("quality"),
         "progress": poll.get("progress"),
         "error_message": poll.get("error_message"),
+        "gait_observation_summary": poll.get("gait_observation_summary"),
     }
     if "_internal_predicted_stage" in poll:
         ai_result_payload["_internal_predicted_stage"] = poll["_internal_predicted_stage"]
@@ -541,11 +530,25 @@ def _build_analysis_response(analysis: Analysis) -> dict:
         return base
 
     if analysis.status == "completed":
+        # Phase 1 (2026-05-21): 응답 단순화.
+        # - prediction 4개 필드만 노출 (decision, risk_level, is_uncertain, display_metrics)
+        # - display_metrics 안에서도 analysis_confidence_score 1개만 노출
+        # - recommendation, quality 응답 제거 (DB ai_result 에는 raw 보존)
+        # - gait_observation_summary 최상위 노출
+        raw_pred = ai.get("prediction") or {}
+        raw_metrics = raw_pred.get("display_metrics") or {}
+        slim_prediction = {
+            "decision": raw_pred.get("decision"),
+            "risk_level": raw_pred.get("risk_level"),
+            "is_uncertain": raw_pred.get("is_uncertain"),
+            "display_metrics": {
+                "analysis_confidence_score": raw_metrics.get("analysis_confidence_score"),
+            },
+        }
         base.update(
             {
-                "quality": ai.get("quality"),
-                "prediction": ai.get("prediction"),
-                "recommendation": ai.get("recommendation"),
+                "prediction": slim_prediction,
+                "gait_observation_summary": ai.get("gait_observation_summary"),
             }
         )
         return base

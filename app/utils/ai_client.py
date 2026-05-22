@@ -48,6 +48,8 @@ from pathlib import Path
 
 import aiohttp
 
+from app.utils.url_helper import build_absolute_url
+
 
 # ============================================
 # 환경 변수
@@ -88,23 +90,17 @@ class AIServerUnavailable(Exception):
 # ============================================
 # 1. 분석 요청 (동기 호출, 백그라운드 태스크에서 사용)
 # ============================================
-async def submit_analysis(video_file_path: str) -> dict:
+async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
     """
     AI 서버에 영상 분석 요청 (동기 호출, 최대 72초+ 소요).
+    Phase 2 (2026-05-22): 페이로드 = multipart/form-data { pet_id, video_id, video_url }.
+    파일은 첨부하지 않음 — AI 서버가 video_url 을 HTTP GET 으로 직접 다운로드.
+
+    multipart 선택 근거: AI Swagger 가 multipart/form-data 명시. 기존 AI 서버도 동일 형식.
+    aiohttp.FormData 사용 시 boundary 자동 생성 + Content-Type 자동 설정.
 
     Returns:
         백엔드 응답 포맷 dict — _transform_ai_to_backend() 결과
-        {
-          "job_id": str,
-          "status": "completed" | "rejected" | "failed",
-          "risk_level": str | None,
-          "prediction": dict | None,
-          "recommendation": dict | None,
-          "quality": dict | None,
-          "progress": None,
-          "error_message": str | None,
-          ("_internal_predicted_stage": int | None  — AI_INTERNAL_STAGE_MAPPING=true 일 때만)
-        }
 
     Raises:
         AIServerUnavailable: 환경변수 미설정, 타임아웃, 5xx, 4xx, 네트워크 오류
@@ -116,30 +112,34 @@ async def submit_analysis(video_file_path: str) -> dict:
         raise AIServerUnavailable("AI_SERVER_URL 환경변수가 설정되지 않았습니다")
 
     url = f"{AI_SERVER_URL}/api/v1/patella/analyze"
-    filename = Path(video_file_path).name
-    content_type = _guess_content_type(filename)
+
+    # URL 정책 반전(2026-05-22): 라우터에서 받은 video_url 은 상대경로일 수 있음.
+    # AI 서버는 HTTP GET 다운로드 필요 → 절대 URL 로 변환.
+    # build_absolute_url 은 http(s):// 로 시작하면 그대로 통과(이중 prefix 방지) → 기존 DB 절대 URL row 도 안전.
+    absolute_video_url = build_absolute_url(video_url)
 
     try:
         timeout = aiohttp.ClientTimeout(total=AI_ANALYZE_TIMEOUT_SEC)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            with open(video_file_path, "rb") as f:
-                form = aiohttp.FormData()
-                form.add_field("file", f, filename=filename, content_type=content_type)
-                async with session.post(url, data=form) as response:
-                    if response.status >= 500:
-                        body_text = await _safe_text(response)
-                        raise AIServerUnavailable(
-                            f"AI 서버 오류 {response.status}: {body_text[:200]}"
-                        )
-                    if response.status >= 400:
-                        # 영상 자체 문제 (확장자/길이 등). detail 추출해서 AIServerUnavailable로 던짐.
-                        # 라우터에서 503 ANALYSIS503 으로 응답되며, 별도 매핑 원하면 여기서 분기 추가.
-                        body = await _safe_json(response)
-                        detail = body.get("detail") if isinstance(body, dict) else None
-                        raise AIServerUnavailable(
-                            f"AI 요청 거절 {response.status}: {detail or '알 수 없는 오류'}"
-                        )
-                    ai_resp = await response.json()
+            form = aiohttp.FormData()
+            form.add_field("pet_id", str(pet_id))
+            form.add_field("video_id", str(video_id))
+            form.add_field("video_url", absolute_video_url)
+            async with session.post(url, data=form) as response:
+                if response.status >= 500:
+                    body_text = await _safe_text(response)
+                    raise AIServerUnavailable(
+                        f"AI 서버 오류 {response.status}: {body_text[:200]}"
+                    )
+                if response.status >= 400:
+                    # 영상 다운로드 실패/형식 문제 등. detail 추출해서 AIServerUnavailable 로 던짐.
+                    # 라우터에서 503 ANALYSIS503 으로 응답.
+                    body = await _safe_json(response)
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                    raise AIServerUnavailable(
+                        f"AI 요청 거절 {response.status}: {detail or '알 수 없는 오류'}"
+                    )
+                ai_resp = await response.json()
     except asyncio.TimeoutError:
         raise AIServerUnavailable(f"AI 호출 타임아웃 ({AI_ANALYZE_TIMEOUT_SEC}초)")
     except aiohttp.ClientError as e:
@@ -263,6 +263,8 @@ def _transform_ai_to_backend(ai_resp: dict) -> dict:
     prediction = None
     if status == "completed":
         prediction = {
+            # AI decision 값 (high_risk_possible / clinically_suspicious_possible / uncertain_recheck / no_clear_high_risk_signal)
+            "decision": ai_prediction.get("decision"),
             # AI 값 그대로 통과 (high/suspicious/uncertain/low_signal)
             # TODO(AI팀 어휘 정렬): 명세서 예시는 "moderate_suspicion" 등 다른 어휘 사용 중.
             #   매핑 사전 만들지 말고, AI 어휘로 통일하든지 AI팀과 어휘 합의 필요.
@@ -333,6 +335,15 @@ def _transform_ai_to_backend(ai_resp: dict) -> dict:
                 i.get("message") for i in issues if i.get("message")
             ]
 
+    # ---- gait_observation_summary (Phase 1, 응답 result 최상위 노출용) ----
+    # raw probabilities + display_metrics 보유한 시점에 계산 → ai_result 에 보존
+    gait_observation_summary = None
+    if status == "completed":
+        gait_observation_summary = build_gait_observation_summary(
+            ai_prediction.get("probabilities"),
+            ai_prediction.get("display_metrics"),
+        )
+
     out = {
         "job_id": ai_resp.get("job_id"),
         "status": status,
@@ -344,6 +355,8 @@ def _transform_ai_to_backend(ai_resp: dict) -> dict:
         # AI 동기 호출이라 progress 사용 케이스 없음 (running 상태 거의 발생 X)
         "progress": None,
         "error_message": ai_resp.get("error_message"),
+        # Phase 1: 보행 관찰 요약 (최상위 노출)
+        "gait_observation_summary": gait_observation_summary,
     }
 
     # ---- 내부 매핑 (병원 추천 점수용, 응답 노출 금지) ----
@@ -561,6 +574,37 @@ _DISPLAY_METRICS_KEYS = (
     "analysis_confidence_score",
     "analysis_confidence_level",
 )
+
+
+def build_gait_observation_summary(probabilities, display_metrics):
+    """
+    AI raw probabilities + display_metrics 기반 보행 관찰 요약 문장 생성.
+    - 해성님 제공 JS 로직 그대로 이식 (Phase 1, 2026-05-21)
+    - 입력 모두 None / 빈 dict 면 None 반환
+    - 응답 result 최상위에 노출
+    """
+    if not probabilities and not display_metrics:
+        return None
+    probabilities = probabilities or {}
+    display_metrics = display_metrics or {}
+
+    high_risk_score = (probabilities.get("prob_target_high_risk") or 0) * 100
+    suspicious_score = display_metrics.get("suspicious_signal_score") or 0
+    abnormal_score = display_metrics.get("abnormal_signal_score") or 0
+
+    if high_risk_score >= 60:
+        return "고위험 보행 패턴과 유사한 신호가 강하게 관찰되었습니다."
+    if suspicious_score >= 50:
+        return "슬개골 관련 의심 보행 패턴이 뚜렷하게 관찰되었습니다."
+    if suspicious_score >= 30 and abnormal_score >= 20:
+        return "슬개골 의심 신호와 보행 이상 신호가 함께 일부 관찰되었습니다."
+    if suspicious_score >= 30:
+        return "슬개골 관련 의심 신호가 일부 관찰되었습니다."
+    if abnormal_score >= 20:
+        return "보행 균형이나 움직임 흐름에서 일부 불규칙한 신호가 관찰되었습니다."
+    if high_risk_score >= 8 or suspicious_score >= 10:
+        return "일부 약한 신호는 있으나 뚜렷한 보행 특징으로 보기는 어렵습니다."
+    return "현재 영상에서는 뚜렷한 보행 이상 특징이 관찰되지 않았습니다."
 
 
 def _build_display_metrics(ai_pred):
