@@ -66,3 +66,5 @@ test_*.mp4
 
 # pytest 캐시
 .pytest_cache/
+
+scripts/
