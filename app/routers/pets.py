@@ -28,8 +28,9 @@ from app.models.pet import Pet
 from app.models.analysis import Analysis
 from app.schemas.pet import PetUpdateRequest, DogBreed, Gender
 from app.schemas.user import CommonResponse
+from app.utils import r2_client
 from app.utils.security import get_current_user
-from app.utils.file_handler import is_allowed_extension, save_pet_image
+from app.utils.file_handler import delete_pet_image, is_allowed_extension, save_pet_image
 from app.utils.datetime_helper import to_kst_iso
 # 2026-05-22 URL 정책 반전: 응답은 상대경로 그대로. build_absolute_url 사용 안 함.
 from app.constants import MEDICAL_HISTORY_OPTIONS
@@ -217,6 +218,19 @@ async def create_pet(
                     "isSuccess": False,
                     "code": "COMMON400",
                     "message": str(e),
+                    "result": None,
+                },
+            )
+        except r2_client.R2UploadError as e:
+            # R2 업로드 실패 → 방금 만든 Pet 롤백 + 503 (videos.py 와 동일 패턴, 단계 C)
+            db.delete(new_pet)
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "isSuccess": False,
+                    "code": "STORAGE503",
+                    "message": f"이미지 업로드에 실패했습니다. ({e})",
                     "result": None,
                 },
             )
@@ -458,7 +472,7 @@ def update_pet(
 # DELETE /pets/{pet_id} — 반려견 삭제
 # ============================================
 @router.delete("/{pet_id}", response_model=CommonResponse, status_code=status.HTTP_200_OK)
-def delete_pet(
+async def delete_pet(
     pet_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -467,6 +481,7 @@ def delete_pet(
     반려견 삭제
     - 권한 체크: 본인 반려견만 삭제 가능
     - CASCADE 삭제: 관련 analyses, favorites 같이 삭제 (DB 레벨)
+    - 프로필 이미지가 있으면 R2 객체도 정리 (실패해도 DB 삭제는 진행 — 단계 C, 2026-05-22)
     """
     pet = db.query(Pet).filter(Pet.pet_id == pet_id).first()
 
@@ -492,8 +507,15 @@ def delete_pet(
             },
         )
 
+    # R2 정리에 쓸 이미지 URL 은 DB 삭제 전에 캡처해 둠.
+    image_url_to_cleanup = pet.profile_image_url
+
     db.delete(pet)
     db.commit()
+
+    # R2 객체 삭제는 best-effort. 실패해도 응답은 성공으로 (delete_pet_image 자체가 예외 삼킴).
+    if image_url_to_cleanup:
+        await delete_pet_image(image_url_to_cleanup)
 
     return CommonResponse(
         isSuccess=True,
