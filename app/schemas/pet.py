@@ -57,6 +57,10 @@ Gender = Literal["MALE", "FEMALE"]
 class LatestAnalysisResponse(BaseModel):
     analysis_id: int
     status: str = Field(..., description="queued/running/completed/rejected/failed")
+    video_url: Optional[str] = Field(
+        None,
+        description="분석 영상 상대경로 (예: /uploads/videos/{uuid}.mp4). 옵션 W — 옛 row 호환 위해 None 허용",
+    )
     risk_level: Optional[str] = Field(None, description="AI 위험도 라벨 (예: moderate_suspicion)")
     predicted_stage: Optional[int] = Field(None, description="예측 단계 (1~4)")
     estimated_stage: Optional[str] = Field(None, description="예측 단계 한글 표현 (예: '2기 의심')")

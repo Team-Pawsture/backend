@@ -348,6 +348,8 @@ def get_pet_detail(
         latest_analysis = {
             "analysis_id": latest.analysis_id,
             "status": latest.status,
+            # 옵션 W: DB 상대경로 그대로. build_absolute_url 호출 X.
+            "video_url": latest.video_url,
             "risk_level": latest.risk_level,
             "predicted_stage": prediction.get("predicted_stage")
             or prediction.get("predictedStage"),

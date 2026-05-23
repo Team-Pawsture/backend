@@ -485,6 +485,9 @@ def _build_analysis_response(analysis: Analysis) -> dict:
         "analysis_id": analysis.analysis_id,
         "pet_id": analysis.pet_id,
         "status": analysis.status,
+        # 옵션 W: DB 상대경로 그대로 노출. 프론트가 BASE_URL prefix 부착 → legacy_uploads 가 R2 로 302.
+        # 모든 status(queued/running/completed/rejected/failed) 응답에서 일관되게 포함되도록 base 에 둠.
+        "video_url": analysis.video_url,
         "created_at": to_kst_iso(analysis.created_at),
         "completed_at": to_kst_iso(analysis.completed_at),
     }
