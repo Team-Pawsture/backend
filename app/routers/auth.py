@@ -11,7 +11,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.schemas.user import UserSignupRequest, UserLoginRequest, CommonResponse
-from app.utils.security import hash_password, verify_password, create_access_token, get_current_user
+from app.utils.security import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    JWT_EXPIRE_MINUTES,
+)
 from app.utils.datetime_helper import to_kst_iso
 
 
@@ -94,7 +100,8 @@ def login(request: UserLoginRequest, db: Session = Depends(get_db)):
         result={
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            # 실제 JWT 만료(security.JWT_EXPIRE_MINUTES)와 연동해 초 단위로 반환
+            "expires_in": JWT_EXPIRE_MINUTES * 60,
             "user": {
                 "user_id": user.user_id,
                 "username": user.username,

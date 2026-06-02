@@ -465,7 +465,7 @@ def get_recent_analyses(
     - 필터: status=completed (queued/running/rejected/failed 제외)
     - 정렬: Analysis.created_at DESC
     - 응답 result: 배열. 분석 이력 없으면 빈 배열 []
-    - pet_profile_image_url 은 GET /pets 와 동일하게 BASE_URL 포함 절대 URL
+    - pet_profile_image_url 은 DB 상대경로 그대로 노출 (옵션 W, build_absolute_url 미적용)
     """
     rows = (
         db.query(Analysis, Pet)

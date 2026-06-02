@@ -99,8 +99,8 @@ async def get_hospitals(
 ):
     """
     근처 동물병원 리스트 조회
-    - 카카오 로컬 검색 + 네이버 Directions + 자체 DB 매칭
-    - 거리순 정렬
+    - 카카오 로컬 검색 + 자체 DB 매칭
+    - distance_meters 는 Haversine 직선거리로 자체 계산, 거리순 정렬
     """
     try:
         merged = await _build_nearby_hospitals(lat, lng, db)

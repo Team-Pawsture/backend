@@ -230,7 +230,7 @@ async def create_pet(
                 detail={
                     "isSuccess": False,
                     "code": "STORAGE503",
-                    "message": f"이미지 업로드에 실패했습니다. ({e})",
+                    "message": "이미지 업로드에 실패했습니다. 잠시 후 다시 시도해주세요.",
                     "result": None,
                 },
             )
