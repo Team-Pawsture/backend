@@ -33,6 +33,7 @@ AI 분석 서버 클라이언트
 import asyncio
 import os
 import uuid
+from typing import Optional
 
 import aiohttp
 
@@ -78,11 +79,26 @@ class AIServerUnavailable(Exception):
 
 # ============================================
 # 1. 분석 요청 (즉시 응답, 비동기 큐잉 전환)
+# - 2026-06-02 AI 2단계 분석 구조: POST /api/v1/patella/jobs
+#   · 1차(rear_gate): view="rear", parent_job_id 없음
+#   · 2차(fusion): view="side", parent_job_id 필수 (1차 ai_job_id)
 # ============================================
-async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
+async def submit_analysis(
+    *,
+    pet_id: int,
+    video_id: int,
+    video_url: str,
+    analysis_stage: str,  # "rear_gate" or "fusion"
+    view: str,  # "rear" or "side"
+    parent_job_id: Optional[str] = None,  # fusion 시 필수
+) -> dict:
     """
-    AI 서버에 영상 분석 요청 (POST /api/v1/patella/analyses, application/json).
+    AI 서버에 영상 분석 요청 (POST /api/v1/patella/jobs, application/json).
     AI 가 즉시 queued 응답을 돌려주고, 실제 분석은 비동기 큐에서 수행함.
+
+    - pet_id / video_id 는 AI 서버가 string 으로 받으므로 str() 변환 후 전송.
+    - video_url 은 build_absolute_url 적용 (옵션 W: 상대경로 → R2 절대 URL).
+    - parent_job_id 는 2차(fusion) 호출 시 1차(rear_gate)의 ai_job_id.
 
     Returns:
         {
@@ -94,12 +110,12 @@ async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
         AIServerUnavailable: 환경변수 미설정, 타임아웃, 5xx, 4xx, 네트워크 오류
     """
     if AI_MOCK_MODE:
-        return _mock_submit()
+        return _mock_submit(analysis_stage=analysis_stage)
 
     if not AI_SERVER_URL:
         raise AIServerUnavailable("AI_SERVER_URL 환경변수가 설정되지 않았습니다")
 
-    url = f"{AI_SERVER_URL}/api/v1/patella/analyses"
+    url = f"{AI_SERVER_URL}/api/v1/patella/jobs"
 
     # URL 정책 반전(2026-05-22): 라우터에서 받은 video_url 은 상대경로일 수 있음.
     # AI 서버는 HTTP GET 다운로드 필요 → 절대 URL 로 변환.
@@ -107,10 +123,14 @@ async def submit_analysis(pet_id: int, video_id: int, video_url: str) -> dict:
     absolute_video_url = build_absolute_url(video_url)
 
     body = {
-        "pet_id": pet_id,
-        "video_id": video_id,
+        "pet_id": str(pet_id),
+        "video_id": str(video_id),
         "video_url": absolute_video_url,
+        "view": view,
+        "analysis_stage": analysis_stage,
     }
+    if parent_job_id:
+        body["parent_job_id"] = parent_job_id
 
     try:
         timeout = aiohttp.ClientTimeout(total=AI_SUBMIT_TIMEOUT_SEC)
@@ -378,84 +398,84 @@ def _transform_ai_to_backend(ai_resp: dict) -> dict:
 # - submit: 항상 queued 즉시 응답 (실제 AI 비동기 큐잉과 동일)
 # - fetch:  AI_MOCK_SCENARIO 에 따라 completed / rejected / failed envelope 반환
 # ============================================
-def _mock_submit() -> dict:
-    """비동기 큐잉 mock — 즉시 queued envelope 반환."""
+def _mock_submit(analysis_stage: str = "rear_gate") -> dict:
+    """비동기 큐잉 mock — 즉시 queued envelope 반환 (2단계 구조)."""
     job_id = f"mock_{uuid.uuid4().hex[:12]}"
     raw = {
         "job_id": job_id,
         "status": "queued",
-        "prediction": None,
-        "quality": None,
-        "completed_at": None,
+        "stage": "queued",
+        "analysis_stage": analysis_stage,
+        "parent_job_id": None,
+        "result": None,
+        "error": None,
         "message": "분석 요청이 접수되었습니다. (mock)",
-        "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
     }
     return {"ai_job_id": job_id, "raw": raw}
 
 
 def _mock_fetch_ai_job_status(ai_job_id: str) -> dict:
-    """폴링 mock — AI_MOCK_SCENARIO 분기로 terminal envelope 반환."""
-    if AI_MOCK_SCENARIO == "rejected":
-        return {
-            "job_id": ai_job_id,
-            "status": "rejected",
-            "quality": {
-                "status": "rejected",
-                "is_acceptable": False,
-                "issues": [
-                    {
-                        "code": "too_short",
-                        "severity": "reject",
-                        "message": "영상이 너무 짧습니다. 강아지의 측면 보행이 4.5초 이상 보이도록 다시 촬영해 주세요.",
-                    }
-                ],
-            },
-            "prediction": None,
-            "message": "영상 품질 문제로 분석을 진행할 수 없습니다.",
-            "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
-        }
+    """폴링 mock — AI_MOCK_SCENARIO 분기로 terminal envelope 반환 (2단계 구조).
 
+    - failed: status=failed + error
+    - rear_gate (기본): 1차 succeeded, decision=SIDE_UPLOAD_REQUIRED
+    - fusion: 2차 succeeded, decision=SUSPECTED_ABNORMAL_GAIT
+    """
     if AI_MOCK_SCENARIO == "failed":
         return {
             "job_id": ai_job_id,
             "status": "failed",
-            "error_message": "AI 분석 중 오류가 발생했습니다. (mock)",
-            "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+            "stage": "failed",
+            "analysis_stage": "rear_gate",
+            "parent_job_id": None,
+            "result": None,
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "AI 분석 중 오류가 발생했습니다. (mock)",
+            },
         }
 
-    # 기본: completed (clinically_suspicious_possible 시나리오)
+    if AI_MOCK_SCENARIO == "fusion":
+        return {
+            "job_id": ai_job_id,
+            "status": "succeeded",
+            "stage": "completed",
+            "analysis_stage": "fusion",
+            "parent_job_id": "mock_parent_job",
+            "result": {
+                "decision": "SUSPECTED_ABNORMAL_GAIT",
+                "risk_level": "suspected",
+                "next_action": "증상이 반복되면 동물병원 검진을 권장합니다.",
+                "scores": {
+                    "suspicious_signal_score": 45.0,
+                    "abnormal_signal_score": 20.0,
+                },
+                "quality": {"is_acceptable": True, "issues": []},
+                "message": "측면 융합 분석 결과 슬개골 이상 보행 가능성이 관찰되었습니다. (mock)",
+                "disclaimer": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+            },
+            "error": None,
+        }
+
+    # 기본: 1차(rear_gate) succeeded — SIDE_UPLOAD_REQUIRED 시나리오
     return {
         "job_id": ai_job_id,
-        "status": "completed",
-        "prediction": {
-            "decision": "clinically_suspicious_possible",
-            "risk_level": "suspicious",
-            "probabilities": {
-                "prob_target_high_risk": 0.25,
-                "prob_target_suspicious": 0.45,
-                "prob_target_abnormal": 0.20,
+        "status": "succeeded",
+        "stage": "completed",
+        "analysis_stage": "rear_gate",
+        "parent_job_id": None,
+        "result": {
+            "decision": "SIDE_UPLOAD_REQUIRED",
+            "risk_level": "suspected",
+            "next_action": "측면 영상을 업로드하여 2차 분석을 진행해 주세요.",
+            "scores": {
+                "rear_abnormality_score": 55.0,
             },
-            "is_uncertain": False,
-            "is_high_risk": False,
-            "user_message": "보행 중 후지 움직임에 비대칭이 관찰되어 슬개골 이상 보행 가능성이 있습니다. 증상이 반복되거나 다리를 들거나 핥는 행동이 보이면 동물병원 검진을 권장합니다.",
-            "display_metrics": {
-                "suspicious_signal_score": 45.0,
-                "abnormal_signal_score": 20.0,
-                "analysis_confidence_score": 78.0,
-                "analysis_confidence_level": "medium",
-                "score_unit": "percent",
-                "analysis_confidence_source": "probabilities_max",
-            },
-            "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+            "quality": {"is_acceptable": True, "issues": []},
+            "message": "후면 영상에서 이상 신호가 관찰되어 측면 영상 분석이 필요합니다. (mock)",
+            "disclaimer": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
         },
-        "quality": {
-            "status": "passed",
-            "is_acceptable": True,
-            "issues": [],
-        },
-        "completed_at": "2026-05-22T10:00:00+00:00",
-        "message": "분석이 완료되었습니다. (mock)",
-        "safety_note": "이 결과는 의학적 진단이 아닌 보행 기반 위험도 스크리닝입니다.",
+        "error": None,
     }
 
 

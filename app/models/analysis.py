@@ -8,6 +8,11 @@ Analysis 모델 (영상 분석 테이블)
 - 2026-05-22 변경: AI 서버 비동기 큐잉 전환
   · ai_job_id 컬럼 추가 (POST /api/v1/patella/analyses 응답 직후 저장,
     이후 GET /api/v1/patella/jobs/{ai_job_id} 폴링 키)
+- 2026-06-02 변경: AI 2단계 분석 구조 도입 (해성님 새 명세)
+  · analysis_stage 컬럼 추가 (rear_gate / fusion)
+  · view 컬럼 추가 (rear / side)
+  · parent_analysis_id 컬럼 추가 (2차 fusion 이 1차 rear_gate 를 가리키는 self FK)
+  · AI 엔드포인트 /api/v1/patella/analyses → /jobs 로 변경. ai_result 에 새 응답 envelope 통째 저장.
 """
 
 from sqlalchemy import Column, BigInteger, String, DateTime, ForeignKey, JSON
@@ -31,6 +36,25 @@ class Analysis(Base):
         nullable=True,
         index=True,
         comment="AI 비동기 폴링용 job ID (POST /analyses 응답에서 즉시 수신)",
+    )
+    # 2026-06-02 AI 2단계 분석 구조
+    analysis_stage = Column(
+        String(20),
+        nullable=False,
+        server_default="rear_gate",
+        comment="rear_gate(1차) / fusion(2차)",
+    )
+    view = Column(
+        String(10),
+        nullable=False,
+        server_default="rear",
+        comment="rear(후면, 1차) / side(측면, 2차)",
+    )
+    parent_analysis_id = Column(
+        BigInteger,
+        ForeignKey("analyses.analysis_id", ondelete="SET NULL"),
+        nullable=True,
+        comment="2차 fusion 이 가리키는 1차 rear_gate 분석 ID",
     )
     status = Column(
         String(20),

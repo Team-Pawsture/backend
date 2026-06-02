@@ -339,24 +339,17 @@ def get_pet_detail(
 
     latest_analysis = None
     if latest:
-        ai_result = latest.ai_result if isinstance(latest.ai_result, dict) else {}
-        prediction = ai_result.get("prediction") if isinstance(ai_result, dict) else None
-        prediction = prediction if isinstance(prediction, dict) else {}
-        recommendation = ai_result.get("recommendation") if isinstance(ai_result, dict) else None
-        recommendation = recommendation if isinstance(recommendation, dict) else {}
-
+        # 2026-06-02 AI 2단계 분석 구조: 기존 prediction/recommendation 구조 폐기.
+        # predicted_stage/estimated_stage/confidence/summary 제거 (새 AI 응답에 없는 필드).
+        # 대신 analysis_stage/view/risk_level/video_url/completed_at 노출.
         latest_analysis = {
             "analysis_id": latest.analysis_id,
             "status": latest.status,
+            "analysis_stage": latest.analysis_stage,
+            "view": latest.view,
             # 옵션 W: DB 상대경로 그대로. build_absolute_url 호출 X.
             "video_url": latest.video_url,
             "risk_level": latest.risk_level,
-            "predicted_stage": prediction.get("predicted_stage")
-            or prediction.get("predictedStage"),
-            "estimated_stage": prediction.get("estimated_stage")
-            or prediction.get("estimatedStage"),
-            "confidence": prediction.get("confidence"),
-            "summary": recommendation.get("summary"),
             "completed_at": to_kst_iso(latest.completed_at),
         }
 
