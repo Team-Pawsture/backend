@@ -1,18 +1,23 @@
 """
-영상 분석 관련 API 라우터
-- POST /analyses : 영상 분석 요청 (JSON {pet_id, video_id})
-- GET /analyses/{analysis_id} : 분석 결과 조회 (폴링)
+영상 분석 관련 API 라우터 (2026-06-02 AI 2단계 분석 구조, 비동기 폴링)
+- POST /analyses          : 분석 요청 (JSON {pet_id, video_id, analysis_stage, parent_analysis_id?})
+                            · 1차(rear_gate) / 2차(fusion) 분기
+- GET  /analyses          : 특정 반려견 분석 이력 (pet_id, 페이지네이션)
+- GET  /analyses/recent   : 본인 반려견 최근 completed 목록
+- GET  /analyses/{id}     : 분석 결과 조회 (폴링)
+- GET  /analyses/{id}/keypoints : 관절 키포인트 시계열 프록시
 
-2026-05-17 v2: 명세서 v2 기준 신규 구현
-2026-05-22 v4: AI 서버 비동기 큐잉 전환
-- AI POST /api/v1/patella/analyses 가 즉시 queued 응답 → job_id 발급.
-- 흐름:
+비동기 폴링 흐름:
   1) POST /analyses → Analysis(status=queued, ai_job_id=None) 생성 + commit (analysis_id 확정)
-  2) submit_analysis() 동기 호출 → ai_job_id 수신 (수초 내) → Analysis.ai_job_id 업데이트
+  2) submit_analysis() 호출 → AI 즉시 queued 응답에서 ai_job_id 수신 → Analysis.ai_job_id 저장
   3) AI 호출 실패 시 status=failed 로 기록 후 503 반환
   4) GET /analyses/{id} 마다 status terminal 아니면 fetch_ai_job_status() 로 폴링
-     · completed/rejected/failed → DB 영구 캐시
+     · AI status(queued/running/succeeded/failed) → 백엔드 status 매핑 후 DB 캐시
      · 폴링 실패(timeout 등) → 현재 DB 상태 그대로 응답 (클라가 재시도)
+
+응답 가공(라우터에서 수행):
+  · result.display_metrics : 화면 4영역(슬개골 위험도/재촬영/신뢰도/보행이상) 매핑
+  · result.solutions       : decision별 맞춤 솔루션 텍스트
 """
 
 from datetime import datetime, timezone

@@ -1,33 +1,32 @@
 """
-AI 분석 서버 클라이언트
-- AI 서버 명세 v4 (2026-05-22 비동기 큐잉 전환):
-  · POST /api/v1/patella/analyses (JSON, 즉시 queued 응답)
-  · GET  /api/v1/patella/jobs/{ai_job_id} (폴링)
+AI 분석 서버 클라이언트 (2026-06-02 AI 2단계 분석 구조, 비동기 폴링)
+- AI 서버 엔드포인트:
+  · POST /api/v1/patella/jobs            (JSON, 즉시 queued 응답 → job_id 발급)
+  · GET  /api/v1/patella/jobs/{job_id}   (상태/결과 폴링)
+  · GET  /api/v1/patella/jobs/{job_id}/keypoints (관절 키포인트 시계열)
+- 2단계 분석:
+  · 1차(rear_gate, view="rear")  : 후면 영상 분석 → 측면 필요 여부 decision
+  · 2차(fusion,    view="side")  : 측면 영상 fusion 분석 (parent_job_id 로 1차 연결)
 - 호출 흐름:
   1) 라우터가 POST /analyses 처리 중 submit_analysis() 호출 → ai_job_id 즉시 수신
   2) 클라이언트 폴링 GET /analyses/{id} 마다 fetch_ai_job_status() 호출 → DB 업데이트
   3) status terminal 도달 후로는 DB 캐시 응답
 
-응답 매핑 정책 (의료 정보 안전)
+응답 매핑 정책
 ────────────────────────────────────────────────────────────────────────────
-- 임시 추론 금지. AI가 제공하지 않는 의료 필드는 항상 null + TODO 주석.
-  · predicted_stage / estimated_stage  : null (AI는 decision만 제공)
-  · class_probabilities                : null (AI 3종 확률 vs 명세 5단계 — 매핑 미확정)
-  · quality.score                      : null (AI 미제공)
-- 응답에 노출되는 risk_level은 AI 값 그대로 통과 (high/suspicious/uncertain/low_signal).
-  매핑 사전 만들지 않음 — 프론트 표시는 클라이언트에서 처리.
-- confidence는 AI probabilities 중 최대값 사용 (실제 신뢰도 신호로 활용).
-- recommendation.summary/action 모두 AI user_message 그대로 사용 (decision 사전 X).
-- 추후 AI팀과 매핑 규칙 확정 시 _transform_ai_to_backend()의 TODO 부분만 채우면 됨.
+- 본 클라이언트는 AI envelope 를 가공하지 않고 raw 그대로 반환한다.
+  · submit_analysis()      → {"ai_job_id", "raw": <envelope>}
+  · fetch_ai_job_status()  → AI envelope dict (status, analysis_stage, result, error ...)
+- AI status(queued/running/succeeded/failed) → 백엔드 status 매핑, 그리고
+  result(decision/risk_level/scores ...) → 화면 표시용 display_metrics / solutions 가공은
+  모두 라우터(app/routers/analyses.py)에서 수행한다.
 
 환경변수
 ────────────────────────────────────────────────────────────────────────────
 - AI_SERVER_URL                  : AI 서버 base URL (끝 / 없이)
 - AI_INTERNAL_API_KEY            : AI 서버 Bearer 토큰 (Authorization 헤더 값)
 - AI_MOCK_MODE                   : true면 실제 호출 없이 가짜 응답 반환
-- AI_MOCK_SCENARIO               : mock 응답 종류 (completed | rejected | failed)
-- AI_INTERNAL_STAGE_MAPPING      : true면 병원 추천 점수용 _internal_predicted_stage 채움
-                                   (응답 노출 X, 라우터/추천 로직에서만 참조)
+- AI_MOCK_SCENARIO               : mock 응답 종류 (completed | fusion | failed)
 """
 
 import asyncio
@@ -47,7 +46,6 @@ AI_SERVER_URL = os.getenv("AI_SERVER_URL", "").rstrip("/")
 AI_INTERNAL_API_KEY = os.getenv("AI_INTERNAL_API_KEY", "")
 AI_MOCK_MODE = os.getenv("AI_MOCK_MODE", "false").lower() == "true"
 AI_MOCK_SCENARIO = os.getenv("AI_MOCK_SCENARIO", "completed").lower()
-AI_INTERNAL_STAGE_MAPPING = os.getenv("AI_INTERNAL_STAGE_MAPPING", "false").lower() == "true"
 
 
 # ============================================
@@ -57,20 +55,6 @@ AI_INTERNAL_STAGE_MAPPING = os.getenv("AI_INTERNAL_STAGE_MAPPING", "false").lowe
 # ============================================
 AI_SUBMIT_TIMEOUT_SEC = 30
 AI_POLL_TIMEOUT_SEC = 60
-
-
-# ============================================
-# AI decision → predicted_stage 내부 매핑 (병원 추천 점수용)
-# - AI_INTERNAL_STAGE_MAPPING=true 일 때만 _internal_predicted_stage 필드에 담김
-# - 응답에는 절대 노출하지 않음 (의료 정보 안전 정책)
-# - 추후 AI팀과 매핑 규칙 확정되면 응답 prediction.predicted_stage 로 이전
-# ============================================
-_INTERNAL_STAGE_BY_DECISION = {
-    "high_risk_possible": 3,
-    "clinically_suspicious_possible": 2,
-    "uncertain_recheck": None,
-    "no_clear_high_risk_signal": None,
-}
 
 
 class AIServerUnavailable(Exception):
@@ -168,7 +152,7 @@ async def submit_analysis(
 async def fetch_ai_job_status(ai_job_id: str) -> dict:
     """
     AI 서버에서 ai_job_id 의 현재 상태/결과 envelope 조회.
-    응답은 변환하지 않고 raw 그대로 반환 — 라우터에서 _transform_ai_to_backend() 적용.
+    응답은 변환하지 않고 AI envelope raw 그대로 반환 — status 매핑/가공은 라우터에서 수행.
 
     Returns:
         AI envelope dict (status, prediction, quality, completed_at, error_message ...)
@@ -274,125 +258,6 @@ async def fetch_keypoints(job_id: str) -> dict:
 
 
 # ============================================
-# 2. AI 응답 → 백엔드 응답 포맷 변환
-# - 의료 정보 안전 정책: AI 미제공 필드는 항상 null + TODO
-# ============================================
-def _transform_ai_to_backend(ai_resp: dict) -> dict:
-    status = ai_resp.get("status")
-    ai_prediction = ai_resp.get("prediction") or {}
-    ai_quality = ai_resp.get("quality") or {}
-
-    # ---- prediction ----
-    prediction = None
-    if status == "completed":
-        prediction = {
-            # AI decision 값 (high_risk_possible / clinically_suspicious_possible / uncertain_recheck / no_clear_high_risk_signal)
-            "decision": ai_prediction.get("decision"),
-            # AI 값 그대로 통과 (high/suspicious/uncertain/low_signal)
-            # TODO(AI팀 어휘 정렬): 명세서 예시는 "moderate_suspicion" 등 다른 어휘 사용 중.
-            #   매핑 사전 만들지 말고, AI 어휘로 통일하든지 AI팀과 어휘 합의 필요.
-            "risk_level": ai_prediction.get("risk_level"),
-            # TODO(AI팀 매핑 확정): AI는 decision만 제공, stage 미제공 → null 유지
-            "predicted_stage": None,
-            # TODO(AI팀 매핑 확정): decision → 한글 단계 라벨 매핑 협의
-            "estimated_stage": None,
-            # AI probabilities 중 최대값을 confidence로 사용 (실제 신뢰도 신호)
-            "confidence": _max_probability(ai_prediction.get("probabilities")),
-            # TODO(AI팀 매핑 확정): AI 3종(high_risk/suspicious/abnormal) vs 명세 5단계(normal/stage1~4)
-            "class_probabilities": None,
-            # ── 2026-05-18 P5: 확장 필드 (AI 응답 새 키 그대로 전달) ──
-            # bool 플래그는 명시적 변환 (AI가 truthy/falsy 줄 가능성 대비)
-            "is_uncertain": bool(ai_prediction.get("is_uncertain")),
-            "is_high_risk": bool(ai_prediction.get("is_high_risk")),
-            # user_message는 prediction 안에도 노출 (기존 recommendation.summary 와 동일 소스이지만
-            # 프론트 UX에서 prediction 카드 안에 표시되는 경우가 있어 중복 제공)
-            "user_message": ai_prediction.get("user_message"),
-            # display_metrics: AI 직접 제공값 우선, 없으면 probabilities 로 derive.
-            #   포함 키: suspicious_signal_score, abnormal_signal_score,
-            #            analysis_confidence_score, analysis_confidence_level
-            #   AI 미제공 시 분기는 _build_display_metrics() 참고. BL-8.
-            "display_metrics": _build_display_metrics(ai_prediction),
-        }
-
-    # ---- recommendation ----
-    # AI user_message / safety_note 그대로 사용. decision 사전 만들지 않음.
-    # summary(현상 설명)와 action(행동 권고)는 명세상 의미가 다르지만,
-    # AI는 user_message 하나만 제공함 → summary에만 담고 action은 null.
-    # TODO(AI팀 협의): user_message를 summary/action으로 분리하거나, AI에 별도 action 필드 요청.
-    user_message = ai_prediction.get("user_message") or ai_resp.get("message")
-    safety_note = ai_prediction.get("safety_note") or ai_resp.get("safety_note")
-    recommendation = None
-    if status == "completed":
-        recommendation = {
-            "summary": user_message,
-            "action": None,
-            "disclaimer": safety_note,
-        }
-    elif status == "rejected":
-        issues = ai_quality.get("issues") or []
-        # rejected는 issues 메시지가 곧 행동 권고(재촬영 안내)라 action에 채움.
-        # summary는 상위 message 사용.
-        recommendation = {
-            "summary": ai_resp.get("message"),
-            "action": _join_issue_messages(issues) or "영상을 다시 촬영해 주세요.",
-            "disclaimer": safety_note,
-        }
-
-    # ---- quality ----
-    quality = None
-    if status in ("completed", "rejected"):
-        issues = ai_quality.get("issues") or []
-        quality = {
-            "is_analyzable": ai_quality.get("is_acceptable"),
-            # TODO(AI팀): score 노출 정책 협의 (현재 미제공)
-            "score": None,
-            "warnings": [
-                i.get("message")
-                for i in issues
-                if i.get("severity") == "warning" and i.get("message")
-            ],
-        }
-        if status == "rejected":
-            quality["recapture_required"] = True
-            quality["recapture_reasons"] = [
-                i.get("message") for i in issues if i.get("message")
-            ]
-
-    # ---- gait_observation_summary (Phase 1, 응답 result 최상위 노출용) ----
-    # raw probabilities + display_metrics 보유한 시점에 계산 → ai_result 에 보존
-    gait_observation_summary = None
-    if status == "completed":
-        gait_observation_summary = build_gait_observation_summary(
-            ai_prediction.get("probabilities"),
-            ai_prediction.get("display_metrics"),
-        )
-
-    out = {
-        "job_id": ai_resp.get("job_id"),
-        "status": status,
-        # Analysis.risk_level 컬럼 저장용 (응답 prediction.risk_level과 동일 소스)
-        "risk_level": ai_prediction.get("risk_level"),
-        "prediction": prediction,
-        "recommendation": recommendation,
-        "quality": quality,
-        # AI 동기 호출이라 progress 사용 케이스 없음 (running 상태 거의 발생 X)
-        "progress": None,
-        "error_message": ai_resp.get("error_message"),
-        # Phase 1: 보행 관찰 요약 (최상위 노출)
-        "gait_observation_summary": gait_observation_summary,
-    }
-
-    # ---- 내부 매핑 (병원 추천 점수용, 응답 노출 금지) ----
-    # 라우터에서 ai_result에 저장하기 전에 pop("_internal_predicted_stage")로 분리해
-    # 별도 컬럼 또는 ai_result["_internal"] 하위에 격리 권장.
-    if AI_INTERNAL_STAGE_MAPPING and status == "completed":
-        decision = ai_prediction.get("decision")
-        out["_internal_predicted_stage"] = _INTERNAL_STAGE_BY_DECISION.get(decision)
-
-    return out
-
-
-# ============================================
 # Mock 모드 — AI 서버 없이 프론트 연동 테스트
 # - AI_MOCK_SCENARIO 환경변수로 응답 시나리오 전환
 # - submit: 항상 queued 즉시 응답 (실제 AI 비동기 큐잉과 동일)
@@ -482,7 +347,7 @@ def _mock_fetch_ai_job_status(ai_job_id: str) -> dict:
 # ============================================
 # Mock 키포인트 — AI 서버 없이 프론트 스켈레톤 애니메이션 테스트용
 # - AI 명세서 예시 구조 그대로: joints 12개, edges 11개, frames 3개
-# - 응답 변환 X 라 ai_client._transform_ai_to_backend 미적용
+# - 응답 변환 없이 raw 그대로 프록시 (키포인트는 가공 대상 아님)
 # ============================================
 _MOCK_JOINTS = [
     {"id": "ear", "label": "Ear", "model_name": "Ear"},
@@ -581,100 +446,6 @@ def _mock_fetch_keypoints(job_id: str) -> dict:
 # ============================================
 # 내부 헬퍼
 # ============================================
-def _max_probability(probs):
-    """AI probabilities dict → 최대값 (confidence). dict 아니거나 비어있으면 None."""
-    if not isinstance(probs, dict) or not probs:
-        return None
-    numeric = [v for v in probs.values() if isinstance(v, (int, float))]
-    return max(numeric) if numeric else None
-
-
-# 2026-05-18 P5 / 2026-05-19 P8: display_metrics 빌더
-# - 백엔드 응답에 노출할 4개 필드 (score_unit, analysis_confidence_source 등 AI 부가 메타는 제외)
-_DISPLAY_METRICS_KEYS = (
-    "suspicious_signal_score",
-    "abnormal_signal_score",
-    "analysis_confidence_score",
-    "analysis_confidence_level",
-)
-
-
-def build_gait_observation_summary(probabilities, display_metrics):
-    """
-    AI raw probabilities + display_metrics 기반 보행 관찰 요약 문장 생성.
-    - 해성님 제공 JS 로직 그대로 이식 (Phase 1, 2026-05-21)
-    - 입력 모두 None / 빈 dict 면 None 반환
-    - 응답 result 최상위에 노출
-    """
-    if not probabilities and not display_metrics:
-        return None
-    probabilities = probabilities or {}
-    display_metrics = display_metrics or {}
-
-    high_risk_score = (probabilities.get("prob_target_high_risk") or 0) * 100
-    suspicious_score = display_metrics.get("suspicious_signal_score") or 0
-    abnormal_score = display_metrics.get("abnormal_signal_score") or 0
-
-    if high_risk_score >= 60:
-        return "고위험 보행 패턴과 유사한 신호가 강하게 관찰되었습니다."
-    if suspicious_score >= 50:
-        return "슬개골 관련 의심 보행 패턴이 뚜렷하게 관찰되었습니다."
-    if suspicious_score >= 30 and abnormal_score >= 20:
-        return "슬개골 의심 신호와 보행 이상 신호가 함께 일부 관찰되었습니다."
-    if suspicious_score >= 30:
-        return "슬개골 관련 의심 신호가 일부 관찰되었습니다."
-    if abnormal_score >= 20:
-        return "보행 균형이나 움직임 흐름에서 일부 불규칙한 신호가 관찰되었습니다."
-    if high_risk_score >= 8 or suspicious_score >= 10:
-        return "일부 약한 신호는 있으나 뚜렷한 보행 특징으로 보기는 어렵습니다."
-    return "현재 영상에서는 뚜렷한 보행 이상 특징이 관찰되지 않았습니다."
-
-
-def _build_display_metrics(ai_pred):
-    """
-    display_metrics 생성. AI 직접 제공값 우선, 없으면 probabilities 에서 derive.
-
-    매핑 근거 (AI 모델 패키지 v3_two_stage_policy_9_5 기준):
-    - suspicious_signal_score = round(prob_target_suspicious * 100, 1)
-    - abnormal_signal_score   = round(prob_target_abnormal * 100, 1)
-    - analysis_confidence_score: AI 모델 패키지가 아직 산출 안 함 → null
-    - analysis_confidence_level: 동일 사유 → "unknown"
-    추후 AI가 display_metrics 를 직접 보내기 시작하면 그 값을 우선 사용
-    (백엔드 derive 는 fallback). 백로그 BL-8 참고.
-    """
-    if not isinstance(ai_pred, dict):
-        return None
-
-    # 1) AI 직접 제공: 4개 필드만 추림 (지금 AI 모델 패키지엔 없음, 향후 대비)
-    ai_metrics = ai_pred.get("display_metrics")
-    if isinstance(ai_metrics, dict):
-        return {key: ai_metrics.get(key) for key in _DISPLAY_METRICS_KEYS}
-
-    # 2) Fallback: AI probabilities 로 derive
-    probs = ai_pred.get("probabilities")
-    if not isinstance(probs, dict):
-        return None
-
-    susp = probs.get("prob_target_suspicious")
-    abn = probs.get("prob_target_abnormal")
-
-    return {
-        "suspicious_signal_score": (
-            round(susp * 100, 1) if isinstance(susp, (int, float)) else None
-        ),
-        "abnormal_signal_score": (
-            round(abn * 100, 1) if isinstance(abn, (int, float)) else None
-        ),
-        "analysis_confidence_score": None,
-        "analysis_confidence_level": "unknown",
-    }
-
-
-def _join_issue_messages(issues: list) -> str:
-    msgs = [i.get("message") for i in issues if i.get("message")]
-    return " ".join(msgs)
-
-
 async def _safe_text(response: aiohttp.ClientResponse) -> str:
     try:
         return await response.text()

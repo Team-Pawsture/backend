@@ -6,12 +6,11 @@ Pet 관련 Pydantic 스키마
   · breed_etc, medical_history_etc 필드 추가
   · weight 필수
   · NONE + 다른 항목 동시 선택 차단 검증
-  · LatestAnalysisResponse: analyzed_at → completed_at
 """
 
-from datetime import datetime, date
+from datetime import date
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
 
 
 # ============================================
@@ -47,28 +46,6 @@ Gender = Literal["MALE", "FEMALE"]
 # - multipart/form-data로 받기 때문에 라우터에서 Form(...)으로 직접 검증
 # - medical_history는 form에서 콤마 구분 문자열로 받아 라우터에서 list로 파싱
 # ============================================
-
-
-# ============================================
-# 최근 분석 결과 (GET /pets/{pet_id}.latest_analysis)
-# - 명세서: completed_at 사용 (analyzed_at 아님)
-# - status가 completed가 아니면 일부 필드는 null일 수 있음
-# ============================================
-class LatestAnalysisResponse(BaseModel):
-    analysis_id: int
-    status: str = Field(..., description="queued/running/completed/rejected/failed")
-    video_url: Optional[str] = Field(
-        None,
-        description="분석 영상 상대경로 (예: /uploads/videos/{uuid}.mp4). 옵션 W — 옛 row 호환 위해 None 허용",
-    )
-    risk_level: Optional[str] = Field(None, description="AI 위험도 라벨 (예: moderate_suspicion)")
-    predicted_stage: Optional[int] = Field(None, description="예측 단계 (1~4)")
-    estimated_stage: Optional[str] = Field(None, description="예측 단계 한글 표현 (예: '2기 의심')")
-    confidence: Optional[float] = Field(None, description="AI 신뢰도 (0~1)")
-    summary: Optional[str] = Field(None, description="분석 결과 요약 문장")
-    completed_at: Optional[datetime] = Field(None, description="분석 종료 시각 (completed/rejected/failed일 때)")
-
-    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================

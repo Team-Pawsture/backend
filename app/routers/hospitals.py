@@ -7,12 +7,6 @@
 2026-05-17 메모:
 - POST /hospitals/recommend 신규 추가
 - 점수 가중치: 거리 / 영업중 / 고위험 견종 / 슬개골 기왕력
-
-2026-05-18: predicted_stage 기반 전문분야 가중치(+40) 활성화
-- 가장 최근 completed Analysis의 _internal_predicted_stage 참조
-  (queued/running은 제외, AI_INTERNAL_STAGE_MAPPING=true일 때만 값 채워짐)
-- 매칭 규칙: predicted_stage >= 2 AND specialty == "정형외과" → +40
-- specialty 값은 자체 DB hospitals 테이블 한글 그대로 비교 (현재 seed: "정형외과", "내과", "슬개골 전문" 등)
 """
 
 import math
@@ -26,7 +20,6 @@ from app.constants import HIGH_RISK_BREEDS
 from app.database import get_db
 from app.models.user import User
 from app.models.pet import Pet
-from app.models.analysis import Analysis
 from app.models.hospital import Hospital
 from app.schemas.user import CommonResponse
 from app.utils.business_hours import get_today_hours_info
@@ -215,7 +208,6 @@ async def recommend_hospitals(
     """
     반려견 정보 + 사용자 위치 기반 병원 추천 정렬
     - 점수 항목: 거리 / 영업중 / 고위험 견종 / 슬개골 기왕력
-    - predicted_stage 기반 전문분야 가중치는 비활성 (AI 팀 답변 대기)
     - 정렬: 점수 내림차순 → 거리 오름차순 → 이름 오름차순
     """
     pet = db.query(Pet).filter(Pet.pet_id == payload.pet_id).first()
@@ -261,28 +253,12 @@ async def recommend_hospitals(
     )
     is_high_risk_breed = pet.breed in HIGH_RISK_BREEDS
 
-    # 가장 최근 completed Analysis 의 내부 predicted_stage 조회
-    # - queued/running은 제외 (status=="completed" 필터로 보장)
-    # - 응답 prediction.predicted_stage는 의료 정보 안전 정책상 null이므로
-    #   ai_client 의 내부 매핑 결과(_internal_predicted_stage)를 참조
-    # - AI_INTERNAL_STAGE_MAPPING=false 이면 None → +40 가중치 미적용 (정상 동작)
-    latest_completed = (
-        db.query(Analysis)
-        .filter(Analysis.pet_id == pet.pet_id, Analysis.status == "completed")
-        .order_by(Analysis.created_at.desc())
-        .first()
-    )
-    predicted_stage = None
-    if latest_completed and isinstance(latest_completed.ai_result, dict):
-        predicted_stage = latest_completed.ai_result.get("_internal_predicted_stage")
-
     scored = []
     for hosp in nearby:
         score = _compute_recommend_score(
             hosp,
             is_high_risk_breed=is_high_risk_breed,
             has_patella_history=has_patella_history,
-            predicted_stage=predicted_stage,
         )
         scored.append((score, hosp))
 
@@ -306,14 +282,12 @@ async def recommend_hospitals(
 
 # ============================================
 # 내부: 추천 점수 계산
-# - TODO(predicted_stage 활성화)는 본 함수 안에 [3/3]으로 표시. 나머지는 grep으로 추적 가능.
 # ============================================
 def _compute_recommend_score(
     hosp: dict,
     *,
     is_high_risk_breed: bool,
     has_patella_history: bool,
-    predicted_stage: Optional[int] = None,
 ) -> int:
     score = 0
 
@@ -338,13 +312,6 @@ def _compute_recommend_score(
     # 슬개골 기왕력: +15
     if has_patella_history:
         score += 15
-
-    # 전문분야 일치 (+40): predicted_stage >= 2 AND specialty == "정형외과"
-    # - predicted_stage 는 ai_client 의 내부 매핑(_internal_predicted_stage) 값
-    #   · AI_INTERNAL_STAGE_MAPPING=false 또는 completed Analysis 부재 시 None → 미적용
-    # - specialty 는 자체 DB hospitals 테이블 한글 값 그대로 (seed: "정형외과"/"내과"/"슬개골 전문" 등)
-    if predicted_stage is not None and predicted_stage >= 2 and hosp.get("specialty") == "정형외과":
-        score += 40
 
     return score
 
