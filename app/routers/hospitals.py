@@ -6,7 +6,7 @@
 
 2026-05-17 메모:
 - POST /hospitals/recommend 신규 추가
-- 점수 가중치: 거리 / 영업중 / 고위험 견종 / 슬개골 기왕력
+- 점수 가중치: 거리 / 영업중 / 고위험 견종 / 슬개골 기왕력 / 정형외과 우대(슬개골 위험 펫)
 """
 
 import math
@@ -207,7 +207,7 @@ async def recommend_hospitals(
 ):
     """
     반려견 정보 + 사용자 위치 기반 병원 추천 정렬
-    - 점수 항목: 거리 / 영업중 / 고위험 견종 / 슬개골 기왕력
+    - 점수 항목: 거리 / 영업중 / 고위험 견종 / 슬개골 기왕력 / 정형외과 우대(+20, 슬개골 위험 펫)
     - 정렬: 점수 내림차순 → 거리 오름차순 → 이름 오름차순
     """
     pet = db.query(Pet).filter(Pet.pet_id == payload.pet_id).first()
@@ -312,6 +312,11 @@ def _compute_recommend_score(
     # 슬개골 기왕력: +15
     if has_patella_history:
         score += 15
+
+    # 정형외과 우대 (+20): 슬개골 위험 펫(기왕력 OR 고위험견종)이고
+    # 병원 specialty 가 정확히 "정형외과" 일 때만. ("슬개골 전문" 등 다른 표기 제외)
+    if (is_high_risk_breed or has_patella_history) and hosp.get("specialty") == "정형외과":
+        score += 20
 
     return score
 
