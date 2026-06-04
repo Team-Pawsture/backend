@@ -8,6 +8,8 @@
 from datetime import datetime
 from typing import Optional
 
+from app.utils.datetime_helper import KST
+
 
 # 요일 매핑 (Python의 weekday(): 월=0, 화=1, ... 일=6)
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -36,7 +38,9 @@ def get_today_hours_info(business_hours: Optional[dict]) -> tuple[Optional[str],
     if not business_hours:
         return (None, None)
 
-    now = datetime.now()
+    # KST 기준 현재 시각 — 서버 TZ(UTC)와 무관하게 한국시간으로 요일/영업상태 판정.
+    # (datetime.now() naive 사용 시 UTC 서버에서 9시간 밀림 — 영업상태/요일 오작동)
+    now = datetime.now(KST)
     today_key = WEEKDAYS[now.weekday()]
 
     today_info = business_hours.get(today_key)
